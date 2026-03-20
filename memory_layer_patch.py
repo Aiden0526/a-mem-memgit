@@ -93,6 +93,7 @@ class PatchAugmentedMemorySystem:
         session_date_time: Optional[str] = None,
         session_summary: Optional[str] = None,
         turn_position: Optional[int] = None,
+        turn_number: Optional[int] = None,
         dia_id: Optional[str] = None,
         speaker: Optional[str] = None,
     ) -> str:
@@ -111,6 +112,8 @@ class PatchAugmentedMemorySystem:
                 "session_date_time": session_date_time,
                 "session_summary": session_summary,
                 "turn_position": turn_position,
+                "turn_number": turn_number,
+                "turn_number": turn_number,
                 "dia_id": dia_id,
                 "speaker": speaker,
                 "text": content,
@@ -124,6 +127,7 @@ class PatchAugmentedMemorySystem:
                 "session_date_time": session_date_time,
                 "session_summary": session_summary,
                 "turn_position": turn_position,
+                "turn_number": turn_number,
                 "dia_id": dia_id,
                 "speaker": speaker,
                 "text": content,
@@ -202,6 +206,7 @@ class PatchAugmentedMemorySystem:
             "session_date_time": trigger_turn.get("session_date_time"),
             "session_summary": trigger_turn.get("session_summary"),
             "turn_position": trigger_turn.get("turn_position"),
+            "turn_number": trigger_turn.get("turn_number"),
             "dia_id": trigger_turn.get("dia_id"),
             "speaker": trigger_turn.get("speaker"),
         }
@@ -244,12 +249,13 @@ class PatchAugmentedMemorySystem:
     def build_patch_index_document(self, patch_record: Dict[str, Any]) -> str:
         overall = patch_record["patch_overall"]
         changed_bits = []
-        for block in patch_record["changed_nodes"][:2]:
+        for block in patch_record["changed_nodes"]:
             changed_bits.append(
                 f"Node {block['note_id']} before context: {block['before']['context']} after context: {block['after']['context']}"
             )
             if block.get("link_change_summary"):
                 changed_bits.append(block["link_change_summary"])
+        changed_count = len(patch_record['changed_nodes'])
         return " ".join([
             f"Trigger: {patch_record['trigger_turn'].get('text', '')}",
             f"Session summary: {patch_record['trigger_turn'].get('session_summary', '')}",
@@ -259,6 +265,7 @@ class PatchAugmentedMemorySystem:
             f"Change pattern: {overall.get('change_pattern', '')}",
             f"Signals: {', '.join(overall.get('selection_signals', []))}",
             f"Task pattern: {overall.get('task_pattern_summary', '')}",
+            f"Changed node count: {changed_count}",
             " ".join(changed_bits),
         ]).strip()
 
@@ -338,7 +345,7 @@ class PatchAugmentedMemorySystem:
     def format_patch_for_context(self, patch_record: Dict[str, Any]) -> str:
         overall = patch_record["patch_overall"]
         changed_lines = []
-        for block in patch_record["changed_nodes"][:2]:
+        for block in patch_record["changed_nodes"]:
             changed_lines.append(f"- Note {block['note_id']} before context: {block['before']['context']}")
             changed_lines.append(f"  after context: {block['after']['context']}")
             if "tags" in block["changed_fields"]:
@@ -349,7 +356,8 @@ class PatchAugmentedMemorySystem:
                 changed_lines.append(f"  links: {block['link_change_summary']}")
         return (
             f"Session {patch_record['trigger_turn'].get('session_id')} "
-            f"Turn {patch_record['trigger_turn'].get('turn_position')} "
+            f"TurnIndex {patch_record['trigger_turn'].get('turn_position')} "
+            f"TurnNumber {patch_record['trigger_turn'].get('turn_number')} "
             f"({patch_record['trigger_turn'].get('dia_id')}) [historical change]:\n"
             f"Trigger: {patch_record['trigger_turn'].get('text', '')}\n"
             f"Overall summary: {overall.get('overall_summary', '')}\n"
