@@ -45,7 +45,7 @@ class PatchAdvancedMemAgent:
         self.temperature_c5 = temperature_c5
 
     def set_sample(self, sample_id: str):
-        self.memory_system.sample_id = sample_id
+        self.memory_system.set_sample(sample_id)
 
     def add_memory(self, content, time=None, **kwargs):
         self.memory_system.ingest_turn_with_patch_history(content, time=time, **kwargs)
@@ -87,20 +87,24 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
 
     for sample_idx, sample in enumerate(samples):
         agent.set_sample(sample.sample_id)
-        for session_id, turns in sample.conversation.sessions.items():
-            for turn_position, turn in enumerate(turns.turns):
-                conversation_tmp = "Speaker " + turn.speaker + " says : " + turn.text
-                agent.add_memory(
-                    conversation_tmp,
-                    time=turns.date_time,
-                    session_id=session_id,
-                    session_date_time=turns.date_time,
-                    session_summary=sample.session_summary.get(f"session_{session_id}_summary", ""),
-                    turn_position=turn_position,
-                    turn_number=turn_position + 1,
-                    dia_id=turn.dia_id,
-                    speaker=turn.speaker,
-                )
+        if agent.memory_system.has_complete_global_graph_cache():
+            logger.info("sample=%s loaded complete global graph cache; skipping rebuild", sample.sample_id)
+        else:
+            for session_id, turns in sample.conversation.sessions.items():
+                for turn_position, turn in enumerate(turns.turns):
+                    conversation_tmp = "Speaker " + turn.speaker + " says : " + turn.text
+                    agent.add_memory(
+                        conversation_tmp,
+                        time=turns.date_time,
+                        session_id=session_id,
+                        session_date_time=turns.date_time,
+                        session_summary=sample.session_summary.get(f"session_{session_id}_summary", ""),
+                        turn_position=turn_position,
+                        turn_number=turn_position + 1,
+                        dia_id=turn.dia_id,
+                        speaker=turn.speaker,
+                    )
+            agent.memory_system.mark_sample_complete()
 
         patch_summary = agent.memory_system.summarize_patch_inventory()
         patch_dir = agent.memory_system.store.patches_dir(sample.sample_id)
