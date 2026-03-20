@@ -95,7 +95,7 @@ class RobustBaseLLMController(ABC):
 
 
 class RobustOpenAIController(RobustBaseLLMController):
-    def __init__(self, model: str = "gpt-4", api_key: Optional[str] = None):
+    def __init__(self, model: str = "gpt-4", api_key: Optional[str] = None, api_base: Optional[str] = None):
         try:
             from openai import OpenAI
         except ImportError:
@@ -105,7 +105,10 @@ class RobustOpenAIController(RobustBaseLLMController):
             api_key = os.getenv('OPENAI_API_KEY')
         if api_key is None:
             raise ValueError("OpenAI API key not found. Set OPENAI_API_KEY environment variable.")
-        self.client = OpenAI(api_key=api_key)
+        client_kwargs = {"api_key": api_key}
+        if api_base:
+            client_kwargs["base_url"] = api_base
+        self.client = OpenAI(**client_kwargs)
 
     @retry_llm_call(max_retries=2)
     def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
@@ -244,7 +247,7 @@ class RobustLLMController:
     """Factory that selects the right robust LLM controller."""
 
     def __init__(self,
-                 backend: Literal["openai", "ollama", "sglang", "vllm"] = "sglang",
+                 backend: Literal["openai", "openrouter", "ollama", "sglang", "vllm"] = "sglang",
                  model: str = "gpt-4",
                  api_key: Optional[str] = None,
                  api_base: Optional[str] = None,
@@ -252,7 +255,13 @@ class RobustLLMController:
                  sglang_port: int = 30000,
                  check_connection: bool = False):
         if backend == "openai":
-            self.llm = RobustOpenAIController(model, api_key)
+            self.llm = RobustOpenAIController(model, api_key, api_base)
+        elif backend == "openrouter":
+            self.llm = RobustLiteLLMController(
+                model=model,
+                api_base=api_base or "https://openrouter.ai/api/v1",
+                api_key=api_key or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY") or "EMPTY",
+            )
         elif backend == "ollama":
             self.llm = RobustOllamaController(model)
         elif backend == "sglang":
@@ -260,7 +269,7 @@ class RobustLLMController:
         elif backend == "vllm":
             self.llm = RobustVLLMController(model, sglang_host, sglang_port)
         else:
-            raise ValueError("Backend must be 'openai', 'ollama', 'sglang', or 'vllm'")
+            raise ValueError("Backend must be 'openai', 'openrouter', 'ollama', 'sglang', or 'vllm'")
 
         if check_connection:
             self.llm.check_connectivity()
@@ -395,6 +404,28 @@ class RobustAgenticMemorySystem:
             if self.evo_cnt % self.evo_threshold == 0:
                 self.consolidate_memories()
         return note.id
+
+    def add_note_with_trace(self, content: str, time: str = None, **kwargs) -> tuple:
+        """Add a new memory note and return an evolution trace for patch mode."""
+        note = RobustMemoryNote(
+            content=content,
+            llm_controller=self.llm_controller,
+            timestamp=time,
+            **kwargs,
+        )
+        evo_label, note, trace = self.process_memory_with_trace(note)
+        self.memories[note.id] = note
+        self.retriever.add_documents([
+            "content:" + note.content +
+            " context:" + note.context +
+            " keywords: " + ", ".join(note.keywords) +
+            " tags: " + ", ".join(note.tags)
+        ])
+        if evo_label:
+            self.evo_cnt += 1
+            if self.evo_cnt % self.evo_threshold == 0:
+                self.consolidate_memories()
+        return note.id, trace
 
     def consolidate_memories(self):
         """Re-initialize the retriever with current memory state."""
@@ -538,3 +569,96 @@ class RobustAgenticMemorySystem:
         except Exception as e:
             logger.error("Evolution failed for note %s: %s — storing without evolution", note.id, e)
             return False, note
+
+    def process_memory_with_trace(self, note: RobustMemoryNote) -> tuple:
+        """Process a memory note and return a detailed evolution trace."""
+        neighbor_memory, indices = self.find_related_memories(note.content, k=5)
+        trace = {
+            "neighbor_memory": neighbor_memory,
+            "neighbor_indices": indices,
+            "decision_prompt": None,
+            "decision_response": None,
+            "decision_parsed": None,
+            "strengthen_prompt": None,
+            "strengthen_response": None,
+            "strengthen_parsed": None,
+            "update_prompt": None,
+            "update_response": None,
+            "neighbor_updates_parsed": None,
+        }
+
+        if len(indices) == 0:
+            return False, note, trace
+
+        try:
+            decision_prompt = EVOLUTION_DECISION_PROMPT.format(
+                context=note.context,
+                content=note.content,
+                keywords=note.keywords,
+                nearest_neighbors_memories=neighbor_memory,
+            )
+            trace["decision_prompt"] = decision_prompt
+            decision_response = self.llm_controller.llm.get_completion(decision_prompt)
+            trace["decision_response"] = decision_response
+            decision = parse_evolution_decision(decision_response)
+            trace["decision_parsed"] = decision
+            logger.debug("Evolution decision: %s", decision)
+
+            if decision["decision"] == "NO_EVOLUTION":
+                return False, note, trace
+
+            should_strengthen = decision["decision"] in ("STRENGTHEN", "STRENGTHEN_AND_UPDATE")
+            should_update = decision["decision"] in ("UPDATE_NEIGHBOR", "STRENGTHEN_AND_UPDATE")
+
+            if should_strengthen:
+                strengthen_prompt = STRENGTHEN_DETAILS_PROMPT.format(
+                    content=note.content,
+                    keywords=note.keywords,
+                    nearest_neighbors_memories=neighbor_memory,
+                )
+                trace["strengthen_prompt"] = strengthen_prompt
+                strengthen_response = self.llm_controller.llm.get_completion(strengthen_prompt)
+                trace["strengthen_response"] = strengthen_response
+                strengthen = parse_strengthen_details(strengthen_response)
+                trace["strengthen_parsed"] = strengthen
+                logger.debug("Strengthen details: %s", strengthen)
+
+                note.links.extend(strengthen["connections"])
+                if strengthen["tags"]:
+                    note.tags = strengthen["tags"]
+
+            if should_update:
+                update_prompt = UPDATE_NEIGHBORS_PROMPT.format(
+                    content=note.content,
+                    context=note.context,
+                    nearest_neighbors_memories=neighbor_memory,
+                    max_neighbor_idx=len(indices) - 1,
+                    neighbor_count=len(indices),
+                )
+                trace["update_prompt"] = update_prompt
+                update_response = self.llm_controller.llm.get_completion(update_prompt)
+                trace["update_response"] = update_response
+                neighbor_updates = parse_update_neighbors(update_response, len(indices))
+                trace["neighbor_updates_parsed"] = neighbor_updates
+                logger.debug("Neighbor updates: %s", neighbor_updates)
+
+                noteslist = list(self.memories.values())
+                notes_id = list(self.memories.keys())
+                for i in range(min(len(indices), len(neighbor_updates))):
+                    upd = neighbor_updates[i]
+                    memorytmp_idx = indices[i]
+                    if memorytmp_idx >= len(noteslist):
+                        continue
+                    notetmp = noteslist[memorytmp_idx]
+                    if upd["tags"]:
+                        notetmp.tags = upd["tags"]
+                    if upd["context"]:
+                        notetmp.context = upd["context"]
+                    self.memories[notes_id[memorytmp_idx]] = notetmp
+
+            return True, note, trace
+
+        except Exception as e:
+            logger.error("Evolution failed for note %s: %s — storing without evolution", note.id, e)
+            trace["error"] = str(e)
+            return False, note, trace
