@@ -8,7 +8,7 @@ from typing import Dict, List, Optional
 
 
 class PatchStore:
-    """Persist patch records and their retrieval index sidecar."""
+    """Persist patch records and global-graph cache sidecars."""
 
     def __init__(self, root_dir: str):
         self.root_dir = Path(root_dir)
@@ -23,6 +23,33 @@ class PatchStore:
         path = self.sample_dir(sample_id) / "patches"
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    def global_graph_dir(self, sample_id: str) -> Path:
+        path = self.sample_dir(sample_id) / "global_graph"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def global_graph_paths(self, sample_id: str) -> tuple[str, str, str]:
+        graph_dir = self.global_graph_dir(sample_id)
+        return (
+            str(graph_dir / f"memory_cache_sample_{sample_id}.pkl"),
+            str(graph_dir / f"retriever_cache_sample_{sample_id}.pkl"),
+            str(graph_dir / f"retriever_cache_embeddings_sample_{sample_id}.npy"),
+        )
+
+    def build_status_path(self, sample_id: str) -> Path:
+        return self.sample_dir(sample_id) / "build_status.json"
+
+    def save_build_status(self, sample_id: str, status: Dict) -> None:
+        self.build_status_path(sample_id).write_text(
+            json.dumps(status, ensure_ascii=False, indent=2), encoding='utf-8'
+        )
+
+    def load_build_status(self, sample_id: str) -> Optional[Dict]:
+        path = self.build_status_path(sample_id)
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding='utf-8'))
 
     def patch_index_records_path(self, sample_id: str) -> Path:
         return self.sample_dir(sample_id) / "patch_index_records.jsonl"

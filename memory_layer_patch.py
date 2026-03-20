@@ -6,6 +6,7 @@ import copy
 import json
 import logging
 import os
+import pickle
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -47,14 +48,15 @@ class PatchAugmentedMemorySystem:
     ):
         self.sample_id = sample_id
         self.config = config or PatchConfig()
-        self.base_system = RobustAgenticMemorySystem(
-            model_name=model_name,
-            llm_backend=llm_backend,
-            llm_model=llm_model,
-            api_key=api_key,
-            api_base=api_base,
-            sglang_host=sglang_host,
-            sglang_port=sglang_port,
+        self.model_name = model_name
+        self.llm_backend = llm_backend
+        self.llm_model = llm_model
+        self.api_key = api_key
+        self.api_base = api_base
+        self.sglang_host = sglang_host
+        self.sglang_port = sglang_port
+        self.store = PatchStore(
+            store_root or os.path.join(os.path.dirname(__file__), f"cached_memories_patch_{llm_backend}_{llm_model}")
         )
         self.patch_llm = RobustLLMController(
             backend=llm_backend,
@@ -64,12 +66,106 @@ class PatchAugmentedMemorySystem:
             sglang_host=sglang_host,
             sglang_port=sglang_port,
         )
-        self.store = PatchStore(
-            store_root or os.path.join(os.path.dirname(__file__), f"cached_memories_patch_{llm_backend}_{llm_model}")
+        self.loaded_from_complete_cache = False
+        self._initialize_runtime()
+
+    def _initialize_runtime(self) -> None:
+        self.base_system = RobustAgenticMemorySystem(
+            model_name=self.model_name,
+            llm_backend=self.llm_backend,
+            llm_model=self.llm_model,
+            api_key=self.api_key,
+            api_base=self.api_base,
+            sglang_host=self.sglang_host,
+            sglang_port=self.sglang_port,
         )
-        self.patch_retriever = SimpleEmbeddingRetriever(model_name)
+        self.patch_retriever = SimpleEmbeddingRetriever(self.model_name)
         self._patch_counter = 0
+        self.loaded_from_complete_cache = False
+        self._load_global_graph_cache_if_exists()
         self._load_or_build_patch_retriever()
+        self._sync_patch_counter()
+
+    def set_sample(self, sample_id: str) -> None:
+        if self.sample_id == sample_id and (self.base_system.memories or self.store.load_build_status(sample_id)):
+            return
+        self.sample_id = sample_id
+        self._initialize_runtime()
+
+    def _sync_patch_counter(self) -> None:
+        patches = self.store.load_all_patches(self.sample_id)
+        if not patches:
+            self._patch_counter = 0
+            return
+        max_id = 0
+        for patch in patches:
+            try:
+                max_id = max(max_id, int(str(patch.get('patch_id', '0')).split('_')[-1]))
+            except ValueError:
+                continue
+        self._patch_counter = max_id
+
+    def has_complete_global_graph_cache(self) -> bool:
+        status = self.store.load_build_status(self.sample_id) or {}
+        memory_cache_file, retriever_cache_file, retriever_cache_embeddings_file = self.store.global_graph_paths(self.sample_id)
+        return bool(
+            status.get('global_graph_complete')
+            and os.path.exists(memory_cache_file)
+            and os.path.exists(retriever_cache_file)
+            and os.path.exists(retriever_cache_embeddings_file)
+        )
+
+    def _load_global_graph_cache_if_exists(self) -> None:
+        memory_cache_file, retriever_cache_file, retriever_cache_embeddings_file = self.store.global_graph_paths(self.sample_id)
+        status = self.store.load_build_status(self.sample_id) or {}
+        if not status.get('global_graph_complete', False):
+            return
+        if not (
+            os.path.exists(memory_cache_file)
+            and os.path.exists(retriever_cache_file)
+            and os.path.exists(retriever_cache_embeddings_file)
+        ):
+            return
+        with open(memory_cache_file, 'rb') as f:
+            self.base_system.memories = pickle.load(f)
+        self.base_system.retriever = self.base_system.retriever.load(
+            retriever_cache_file, retriever_cache_embeddings_file
+        )
+        self.loaded_from_complete_cache = True
+
+    def _save_global_graph_cache(
+        self,
+        session_id: Optional[int] = None,
+        turn_position: Optional[int] = None,
+        turn_number: Optional[int] = None,
+        complete: bool = False,
+    ) -> None:
+        memory_cache_file, retriever_cache_file, retriever_cache_embeddings_file = self.store.global_graph_paths(self.sample_id)
+        with open(memory_cache_file, 'wb') as f:
+            pickle.dump(self.base_system.memories, f)
+        self.base_system.retriever.save(retriever_cache_file, retriever_cache_embeddings_file)
+        self.store.save_build_status(
+            self.sample_id,
+            {
+                'sample_id': self.sample_id,
+                'global_graph_complete': complete,
+                'last_session_id': session_id,
+                'last_turn_position': turn_position,
+                'last_turn_number': turn_number,
+                'memory_count': len(self.base_system.memories),
+                'updated_at': datetime.utcnow().isoformat() + 'Z',
+            },
+        )
+
+    def mark_sample_complete(self) -> None:
+        status = self.store.load_build_status(self.sample_id) or {}
+        self._save_global_graph_cache(
+            session_id=status.get('last_session_id'),
+            turn_position=status.get('last_turn_position'),
+            turn_number=status.get('last_turn_number'),
+            complete=True,
+        )
+        self.loaded_from_complete_cache = True
 
     def _load_or_build_patch_retriever(self) -> None:
         index_records = self.store.load_patch_index_records(self.sample_id)
@@ -103,6 +199,7 @@ class PatchAugmentedMemorySystem:
 
         diff_result = self.detect_patchable_change(before_memories, after_memories)
         if diff_result["patch_type"] == "additive_only":
+            self._save_global_graph_cache(session_id, turn_position, turn_number, complete=False)
             return note_id
 
         detail_blocks = self.build_patch_detail_blocks(before_memories, after_memories, diff_result)
@@ -112,7 +209,6 @@ class PatchAugmentedMemorySystem:
                 "session_date_time": session_date_time,
                 "session_summary": session_summary,
                 "turn_position": turn_position,
-                "turn_number": turn_number,
                 "turn_number": turn_number,
                 "dia_id": dia_id,
                 "speaker": speaker,
@@ -139,6 +235,7 @@ class PatchAugmentedMemorySystem:
             evolve_trace=evolve_trace,
         )
         self.commit_patch_if_needed(patch_record)
+        self._save_global_graph_cache(session_id, turn_position, turn_number, complete=False)
         return note_id
 
     def detect_patchable_change(self, before_memories: Dict[str, Any], after_memories: Dict[str, Any]) -> Dict[str, Any]:
@@ -318,6 +415,8 @@ class PatchAugmentedMemorySystem:
             session_id = str(patch.get("trigger_turn", {}).get("session_id", "unknown"))
             session_counts[session_id] = session_counts.get(session_id, 0) + 1
             affected_note_counts.append(len(patch.get("changed_nodes", [])))
+        status = self.store.load_build_status(self.sample_id) or {}
+        global_graph_dir = self.store.global_graph_dir(self.sample_id)
         return {
             "sample_id": self.sample_id,
             "patch_count": len(patches),
@@ -325,6 +424,13 @@ class PatchAugmentedMemorySystem:
             "session_patch_counts": session_counts,
             "avg_changed_nodes": (sum(affected_note_counts) / len(affected_note_counts)) if affected_note_counts else 0.0,
             "max_changed_nodes": max(affected_note_counts) if affected_note_counts else 0,
+            "global_graph_dir": str(global_graph_dir),
+            "global_graph_files": sorted(p.name for p in global_graph_dir.glob('*')),
+            "global_graph_complete": bool(status.get('global_graph_complete', False)),
+            "memory_count": status.get('memory_count', len(self.base_system.memories)),
+            "last_session_id": status.get('last_session_id'),
+            "last_turn_position": status.get('last_turn_position'),
+            "last_turn_number": status.get('last_turn_number'),
         }
 
     def retrieve_relevant_patches(self, query: str, top_k: Optional[int] = None) -> List[Dict[str, Any]]:
