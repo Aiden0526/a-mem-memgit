@@ -8,6 +8,8 @@ import json
 import logging
 import os
 import random
+import subprocess
+import sys
 from collections import defaultdict
 from datetime import datetime
 from load_dataset import load_locomo_dataset
@@ -65,9 +67,11 @@ Keywords:"""
 
 def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
                      backend: str = "sglang", temperature_c5: float = 0.5,
-                     retrieve_k: int = 10, patch_top_k: int = 2,
+                     retrieve_k: int = 10, patch_top_k: int = 5,
                      sglang_host: str = "http://localhost", sglang_port: int = 30000,
                      max_samples: int | None = None,
+                     num_workers: int = 1,
+                     worker_id: int = 0,
                      skip_qa: bool = False,
                      api_key: str | None = None,
                      api_base: str | None = None,
@@ -78,12 +82,20 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
         samples = samples[:num_samples]
     if max_samples is not None:
         samples = samples[:max_samples]
+    if num_workers < 1:
+        raise ValueError("num_workers must be at least 1")
+    if worker_id < 0 or worker_id >= num_workers:
+        raise ValueError("worker_id must satisfy 0 <= worker_id < num_workers")
+    if num_workers > 1:
+        samples = [sample for sample_idx, sample in enumerate(samples)
+                   if sample_idx % num_workers == worker_id]
 
     agent = PatchAdvancedMemAgent(model, backend, retrieve_k, temperature_c5,
                                   sglang_host, sglang_port, patch_top_k, api_key, api_base)
     category_counts = defaultdict(int)
 
     sample_patch_summaries = []
+    qa_results = []
 
     for sample_idx, sample in enumerate(samples):
         agent.set_sample(sample.sample_id)
@@ -123,11 +135,22 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
         if skip_qa:
             continue
 
-        for qa in sample.qa:
+        for qa_idx, qa in enumerate(sample.qa):
             category_counts[qa.category] += 1
             prediction, user_prompt, raw_context = agent.answer_question(
                 qa.question, qa.category, qa.final_answer
             )
+            qa_results.append({
+                "sample_index": sample_idx,
+                "sample_id": sample.sample_id,
+                "qa_index": qa_idx,
+                "category": qa.category,
+                "question": qa.question,
+                "prediction": prediction,
+                "reference": qa.final_answer,
+                "user_prompt": user_prompt,
+                "raw_context": raw_context,
+            })
             logger.info("sample=%s category=%s question=%s prediction=%s", sample_idx, qa.category, qa.question, prediction)
             logger.debug("prompt=%s", user_prompt)
             logger.debug("context=%s", raw_context)
@@ -136,11 +159,103 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
         "samples": len(samples),
         "category_counts": dict(category_counts),
         "sample_patch_summaries": sample_patch_summaries,
+        "qa_results": qa_results,
     }
     if inventory_output:
         with open(inventory_output, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
     return result
+
+
+def _worker_inventory_output_path(inventory_output: str | None, worker_id: int) -> str | None:
+    if not inventory_output:
+        return None
+    root, ext = os.path.splitext(inventory_output)
+    suffix = ext or ".json"
+    return f"{root}.worker_{worker_id}{suffix}"
+
+
+def _merge_inventory_results(worker_results: list[dict]) -> dict:
+    category_counts = defaultdict(int)
+    sample_patch_summaries = []
+    qa_results = []
+    total_samples = 0
+    for result in worker_results:
+        total_samples += result.get("samples", 0)
+        for category, count in result.get("category_counts", {}).items():
+            category_counts[int(category)] += count
+        sample_patch_summaries.extend(result.get("sample_patch_summaries", []))
+    return {
+        "samples": total_samples,
+        "category_counts": dict(category_counts),
+        "sample_patch_summaries": sample_patch_summaries,
+    }
+
+
+def run_batch_workers(args) -> dict:
+    if args.batch < 1:
+        raise ValueError("batch must be at least 1")
+
+    child_base = [
+        sys.executable,
+        os.path.abspath(__file__),
+        "--dataset", args.dataset,
+        "--model", args.model,
+        "--backend", args.backend,
+        "--ratio", str(args.ratio),
+        "--retrieve_k", str(args.retrieve_k),
+        "--patch_top_k", str(args.patch_top_k),
+        "--temperature_c5", str(args.temperature_c5),
+        "--sglang_host", args.sglang_host,
+        "--sglang_port", str(args.sglang_port),
+        "--num_workers", str(args.batch),
+    ]
+
+    if args.max_samples is not None:
+        child_base.extend(["--max_samples", str(args.max_samples)])
+    if args.skip_qa:
+        child_base.append("--skip_qa")
+    if args.api_key is not None:
+        child_base.extend(["--api_key", args.api_key])
+    if args.api_base is not None:
+        child_base.extend(["--api_base", args.api_base])
+
+    processes = []
+    worker_outputs = []
+    for worker_id in range(args.batch):
+        worker_output = _worker_inventory_output_path(args.inventory_output, worker_id)
+        cmd = child_base + ["--worker_id", str(worker_id)]
+        if worker_output is not None:
+            cmd.extend(["--inventory_output", worker_output])
+        logger.info("launching worker_id=%s command=%s", worker_id, cmd)
+        processes.append((worker_id, worker_output, subprocess.Popen(cmd)))
+        worker_outputs.append(worker_output)
+
+    failures = []
+    for worker_id, worker_output, process in processes:
+        return_code = process.wait()
+        if return_code != 0:
+            failures.append((worker_id, return_code))
+            logger.error("worker_id=%s failed return_code=%s", worker_id, return_code)
+        else:
+            logger.info("worker_id=%s completed inventory_output=%s", worker_id, worker_output)
+
+    if failures:
+        failed = ", ".join(f"worker {worker_id} (exit {return_code})" for worker_id, return_code in failures)
+        raise RuntimeError(f"batch run failed: {failed}")
+
+    worker_results = []
+    for worker_output in worker_outputs:
+        if worker_output is None:
+            continue
+        with open(worker_output, "r", encoding="utf-8") as f:
+            worker_results.append(json.load(f))
+
+    merged_result = _merge_inventory_results(worker_results)
+    if args.inventory_output:
+        with open(args.inventory_output, "w", encoding="utf-8") as f:
+            json.dump(merged_result, f, ensure_ascii=False, indent=2)
+    return merged_result
 
 
 if __name__ == "__main__":
@@ -155,6 +270,9 @@ if __name__ == "__main__":
     parser.add_argument("--sglang_host", type=str, default="http://localhost")
     parser.add_argument("--sglang_port", type=int, default=30000)
     parser.add_argument("--max_samples", type=int, default=None)
+    parser.add_argument("--num_workers", type=int, default=1)
+    parser.add_argument("--worker_id", type=int, default=0)
+    parser.add_argument("--batch", type=int, default=None)
     parser.add_argument("--skip_qa", action="store_true")
     parser.add_argument("--api_key", type=str, default=None)
     parser.add_argument("--api_base", type=str, default="https://openrouter.ai/api/v1")
@@ -162,6 +280,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
+    if args.batch is not None:
+        if args.batch == 1:
+            args.num_workers = 1
+            args.worker_id = 0
+        else:
+            run_batch_workers(args)
+            sys.exit(0)
+
     evaluate_dataset(
         dataset_path=args.dataset,
         model=args.model,
@@ -173,6 +299,8 @@ if __name__ == "__main__":
         sglang_host=args.sglang_host,
         sglang_port=args.sglang_port,
         max_samples=args.max_samples,
+        num_workers=args.num_workers,
+        worker_id=args.worker_id,
         skip_qa=args.skip_qa,
         api_key=args.api_key,
         api_base=args.api_base,

@@ -1,1 +1,5 @@
 __pycache__/
+cached_memories_patch_openai_google/
+cached_memories_patch_openai_gpt-5.4-mini-2026-03-17/
+cached_memories_robust_openai_gpt-5.4-mini-2026-03-17/
+logs/

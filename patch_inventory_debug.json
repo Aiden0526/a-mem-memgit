@@ -1,0 +1,67 @@
+{
+  "samples": 1,
+  "category_counts": {
+    "2": 37,
+    "3": 13,
+    "1": 32,
+    "4": 70,
+    "5": 47
+  },
+  "sample_patch_summaries": [
+    {
+      "sample_id": "0",
+      "patch_count": 26,
+      "patch_type_counts": {
+        "overwrite_update": 26
+      },
+      "session_patch_counts": {
+        "1": 2,
+        "2": 1,
+        "4": 1,
+        "5": 1,
+        "6": 1,
+        "7": 1,
+        "8": 4,
+        "9": 2,
+        "11": 2,
+        "13": 2,
+        "14": 2,
+        "16": 2,
+        "17": 1,
+        "18": 1,
+        "19": 3
+      },
+      "avg_changed_nodes": 4.384615384615385,
+      "max_changed_nodes": 5,
+      "patch_dir": "/home/Jundong0526/a-mem-memgit/cached_memories_patch_openai_gpt-5.4-mini-2026-03-17/sample_0/patches",
+      "patch_files": [
+        "patch_000001.json",
+        "patch_000002.json",
+        "patch_000003.json",
+        "patch_000004.json",
+        "patch_000005.json",
+        "patch_000006.json",
+        "patch_000007.json",
+        "patch_000008.json",
+        "patch_000009.json",
+        "patch_000010.json",
+        "patch_000011.json",
+        "patch_000012.json",
+        "patch_000013.json",
+        "patch_000014.json",
+        "patch_000015.json",
+        "patch_000016.json",
+        "patch_000017.json",
+        "patch_000018.json",
+        "patch_000019.json",
+        "patch_000020.json",
+        "patch_000021.json",
+        "patch_000022.json",
+        "patch_000023.json",
+        "patch_000024.json",
+        "patch_000025.json",
+        "patch_000026.json"
+      ]
+    }
+  ]
+}
