@@ -10,6 +10,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - optional runtime dependency
+    np = None
+
 from memory_layer import SimpleEmbeddingRetriever
 from memory_layer_robust import RobustAgenticMemorySystem, RobustLLMController
 from patch_prompts import PATCH_CONTEXT_INSTRUCTION, PATCH_SUMMARIZATION_PROMPT
@@ -437,6 +442,21 @@ Keywords:"""
         return summaries
 
     @staticmethod
+    def _to_jsonable(value: Any) -> Any:
+        if np is not None:
+            if isinstance(value, np.ndarray):
+                return value.tolist()
+            if isinstance(value, np.generic):
+                return value.item()
+        if isinstance(value, dict):
+            return {str(k): PatchAugmentedMemorySystem._to_jsonable(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [PatchAugmentedMemorySystem._to_jsonable(v) for v in value]
+        if isinstance(value, tuple):
+            return [PatchAugmentedMemorySystem._to_jsonable(v) for v in value]
+        return value
+
+    @staticmethod
     def _compact_detail_blocks_for_summary(detail_blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         compact = []
         for block in detail_blocks:
@@ -453,7 +473,7 @@ Keywords:"""
 
     @staticmethod
     def _compact_trace(trace: Dict[str, Any]) -> Dict[str, Any]:
-        return {
+        compact = {
             "neighbor_indices": trace.get("neighbor_indices", []),
             "decision_parsed": trace.get("decision_parsed"),
             "strengthen_parsed": trace.get("strengthen_parsed"),
@@ -462,6 +482,7 @@ Keywords:"""
             "strengthen_response": trace.get("strengthen_response"),
             "update_response": trace.get("update_response"),
         }
+        return PatchAugmentedMemorySystem._to_jsonable(compact)
 
     @staticmethod
     def _parse_patch_summary_response(response: str) -> Dict[str, Any]:
