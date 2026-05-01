@@ -114,6 +114,20 @@ Key arguments:
 - `--backend`: One of `openai`, `vllm`, `ollama`.
 - `--sglang_port`: Port for vLLM/SGLang server (default: 30000).
 
+3b. Run the patch-augmented A-Mem evaluation on LoCoMo with an OpenAI-compatible API such as ppapi:
+```bash
+export OPENAI_API_KEY=your_ppapi_key
+export OPENAI_BASE_URL=https://app.ppapi.ai/v1/chat/completions
+
+python test_advanced_patch.py \
+  --backend openai \
+  --model gpt-4o-mini \
+  --dataset data/locomo10.json \
+  --output results_patch_ppapi.json
+```
+
+You can pass either the API root (`https://app.ppapi.ai/v1`) or the full chat-completions endpoint (`https://app.ppapi.ai/v1/chat/completions`) via `--api_base` or `OPENAI_BASE_URL`; the runner normalizes both forms automatically.
+
 4. Run the full k-sweep to find optimal retrieval k per model:
 ```bash
 bash run_k_sweep.sh

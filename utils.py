@@ -9,6 +9,7 @@ from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from bert_score import score as bert_score
 import nltk
 from nltk.translate.meteor_score import meteor_score
+from nltk.tokenize import wordpunct_tokenize
 from sentence_transformers import SentenceTransformer
 import logging
 from dataclasses import dataclass
@@ -49,8 +50,8 @@ def calculate_rouge_scores(prediction: str, reference: str) -> Dict[str, float]:
 
 def calculate_bleu_scores(prediction: str, reference: str) -> Dict[str, float]:
     """Calculate BLEU scores with different n-gram settings."""
-    pred_tokens = nltk.word_tokenize(prediction.lower())
-    ref_tokens = [nltk.word_tokenize(reference.lower())]
+    pred_tokens = wordpunct_tokenize(prediction.lower())
+    ref_tokens = [wordpunct_tokenize(reference.lower())]
     
     weights_list = [(1, 0, 0, 0), (0.5, 0.5, 0, 0), (0.33, 0.33, 0.33, 0), (0.25, 0.25, 0.25, 0.25)]
     smooth = SmoothingFunction().method1

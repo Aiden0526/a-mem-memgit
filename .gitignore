@@ -1,5 +1,52 @@
+# Python
 __pycache__/
-cached_memories_patch_openai_google/
-cached_memories_patch_openai_gpt-5.4-mini-2026-03-17/
-cached_memories_robust_openai_gpt-5.4-mini-2026-03-17/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Local environments and secrets
+.env
+.claude/
+CLAUDE.md
+.venv/
+venv/
+a-mem/
+
+# Logs and runtime traces
 logs/
+*.log
+*.trace.jsonl
+*_trace.jsonl
+
+# Evaluation outputs
+results/
+patch_results/
+robust_results/
+results_mem0*.json
+*.worker_*.json
+*.worker_*.jsonl
+
+# Cached memories / embeddings / intermediate stores
+cached_memories_*/
+*.npy
+*.npz
+*.pkl
+*.pickle
+
+# Local analysis and scratch files
+analysis/
+11.12.1
+
+# Optional large local datasets / archives
+*.zip
+data/__MACOSX/
+data/Persona-release/
+data/Persona-V2-original/
+data/PersonaMem-v2-enhanced-release/
+locomo-plus-data/
+locomo_plus_evaluation_framework/
+
+# OS / editor artifacts
+.DS_Store

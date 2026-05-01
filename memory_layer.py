@@ -8,6 +8,7 @@ from sentence_transformers import SentenceTransformer
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 import os
+import re
 from abc import ABC, abstractmethod
 from transformers import AutoModel, AutoTokenizer
 from nltk.tokenize import word_tokenize
@@ -19,7 +20,11 @@ import json as json_lib
 import time
 
 def simple_tokenize(text):
-    return word_tokenize(text)
+    try:
+        return word_tokenize(text)
+    except LookupError:
+        # Fallback for environments without NLTK punkt/punkt_tab data.
+        return re.findall(r"[A-Za-z0-9_]+", text.lower())
 
 class BaseLLMController(ABC):
     @abstractmethod
@@ -49,7 +54,7 @@ class OpenAIController(BaseLLMController):
             ],
             response_format=response_format,
             temperature=temperature,
-            max_tokens=1000
+            max_completion_tokens=1000
         )
         return response.choices[0].message.content
 

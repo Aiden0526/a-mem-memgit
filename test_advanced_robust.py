@@ -19,6 +19,7 @@ import argparse
 import logging
 from typing import List, Dict, Optional
 from pathlib import Path
+from dotenv import load_dotenv
 import numpy as np
 from load_dataset import load_locomo_dataset, QA, Turn, Session, Conversation
 import nltk
@@ -28,6 +29,8 @@ import statistics
 from collections import defaultdict
 import pickle
 import random
+import subprocess
+import sys
 from tqdm import tqdm
 from utils import calculate_metrics, aggregate_metrics
 from datetime import datetime
@@ -50,22 +53,36 @@ except Exception as e:
 logger = logging.getLogger("amem_robust")
 
 
+def resolve_api_base(api_base: Optional[str]) -> Optional[str]:
+    from memory_layer_robust import normalize_openai_compatible_base_url
+
+    if api_base:
+        return normalize_openai_compatible_base_url(api_base)
+    return normalize_openai_compatible_base_url(
+        os.getenv("OPENAI_BASE_URL") or os.getenv("PPAPI_BASE_URL")
+    )
+
+
 class RobustAdvancedMemAgent:
     """Agent using the robust memory system with plain-text LLM calls."""
 
     def __init__(self, model, backend, retrieve_k, temperature_c5,
-                 sglang_host="http://localhost", sglang_port=30000):
+                 sglang_host="http://localhost", sglang_port=30000,
+                 api_key: Optional[str] = None, api_base: Optional[str] = None):
         self.memory_system = RobustAgenticMemorySystem(
             model_name='all-MiniLM-L6-v2',
             llm_backend=backend,
             llm_model=model,
+            api_key=api_key,
+            api_base=api_base,
             sglang_host=sglang_host,
             sglang_port=sglang_port,
         )
         self.retriever_llm = RobustLLMController(
             backend=backend,
             model=model,
-            api_key=None,
+            api_key=api_key,
+            api_base=api_base,
             sglang_host=sglang_host,
             sglang_port=sglang_port,
         )
@@ -174,10 +191,15 @@ def setup_logger(log_file: Optional[str] = None) -> logging.Logger:
 def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] = None,
                      ratio: float = 1.0, backend: str = "sglang",
                      temperature_c5: float = 0.5, retrieve_k: int = 10,
-                     sglang_host: str = "http://localhost", sglang_port: int = 30000):
+                     sglang_host: str = "http://localhost", sglang_port: int = 30000,
+                     api_key: Optional[str] = None, api_base: Optional[str] = None,
+                     start_sample: int = 0, end_sample: Optional[int] = None,
+                     num_workers: int = 1, worker_id: int = 0,
+                     sample_ids: Optional[List[int]] = None):
     """Evaluate the robust agent on the LoComo dataset."""
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
-    log_filename = f"eval_robust_{model}_{backend}_ratio{ratio}_{timestamp}.log"
+    worker_suffix = f"_worker{worker_id}" if num_workers > 1 else ""
+    log_filename = f"eval_robust_{model}_{backend}_ratio{ratio}{worker_suffix}_{timestamp}.log"
     log_path = os.path.join(os.path.dirname(__file__), "logs", log_filename)
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
 
@@ -185,13 +207,34 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     eval_logger.info(f"Loading dataset from {dataset_path}")
     eval_logger.info(f"Using ROBUST memory layer (no JSON schema dependency)")
 
-    samples = load_locomo_dataset(dataset_path)
+    samples = list(enumerate(load_locomo_dataset(dataset_path)))
     eval_logger.info(f"Loaded {len(samples)} samples")
+
+    if sample_ids:
+        sample_id_set = set(sample_ids)
+        samples = [sample_item for sample_item in samples if sample_item[0] in sample_id_set]
+        eval_logger.info(f"Filtered to sample ids: {sorted(sample_id_set)} ({len(samples)} samples)")
 
     if ratio < 1.0:
         num_samples = max(1, int(len(samples) * ratio))
         samples = samples[:num_samples]
         eval_logger.info(f"Using {num_samples} samples ({ratio*100:.1f}% of dataset)")
+
+    if start_sample < 0:
+        raise ValueError("start_sample must be >= 0")
+    if end_sample is not None and end_sample < start_sample:
+        raise ValueError("end_sample must be >= start_sample")
+    samples = samples[start_sample:end_sample]
+    eval_logger.info("Selected sample range [%s, %s) -> %d samples", start_sample, end_sample, len(samples))
+
+    if num_workers < 1:
+        raise ValueError("num_workers must be at least 1")
+    if worker_id < 0 or worker_id >= num_workers:
+        raise ValueError("worker_id must satisfy 0 <= worker_id < num_workers")
+    if num_workers > 1:
+        samples = [sample_item for position, sample_item in enumerate(samples)
+                   if position % num_workers == worker_id]
+        eval_logger.info(f"Worker {worker_id}/{num_workers} processing {len(samples)} samples")
 
     results = []
     all_metrics = []
@@ -207,10 +250,18 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     )
     os.makedirs(memories_dir, exist_ok=True)
     allow_categories = [1, 2, 3, 4, 5]
+    total_qas_in_run = sum(
+        sum(1 for qa in sample.qa if int(qa.category) in allow_categories)
+        for _, sample in samples
+    )
 
-    for sample_idx, sample in enumerate(samples):
-        agent = RobustAdvancedMemAgent(model, backend, retrieve_k, temperature_c5,
-                                       sglang_host, sglang_port)
+    sample_progress = tqdm(samples, desc="Samples", unit="sample")
+    for shard_idx, (sample_idx, sample) in enumerate(sample_progress):
+        sample_progress.set_postfix_str(f"sample_id={sample_idx}")
+        agent = RobustAdvancedMemAgent(
+            model, backend, retrieve_k, temperature_c5,
+            sglang_host, sglang_port, api_key, api_base,
+        )
 
         memory_cache_file = os.path.join(memories_dir, f"memory_cache_sample_{sample_idx}.pkl")
         retriever_cache_file = os.path.join(memories_dir, f"retriever_cache_sample_{sample_idx}.pkl")
@@ -236,24 +287,30 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
             eval_logger.info(f"Successfully loaded {len(cached_memories)} memories")
         else:
             eval_logger.info(f"No cached memories found for sample {sample_idx}. Creating new memories.")
+            total_turns = sum(len(turns.turns) for turns in sample.conversation.sessions.values())
+            build_progress = tqdm(total=total_turns, desc=f"Build {sample_idx}", unit="turn", leave=False)
 
             for _, turns in sample.conversation.sessions.items():
                 for turn in turns.turns:
                     turn_datatime = turns.date_time
                     conversation_tmp = "Speaker " + turn.speaker + "says : " + turn.text
                     agent.add_memory(conversation_tmp, time=turn_datatime)
+                    build_progress.update(1)
 
+            build_progress.close()
             memories_to_cache = agent.memory_system.memories
             with open(memory_cache_file, 'wb') as f:
                 pickle.dump(memories_to_cache, f)
             agent.memory_system.retriever.save(retriever_cache_file, retriever_cache_embeddings_file)
             eval_logger.info(f"Successfully cached {len(memories_to_cache)} memories")
 
-        eval_logger.info(f"Processing sample {sample_idx + 1}/{len(samples)}")
+        eval_logger.info(f"Processing sample {shard_idx + 1}/{len(samples)} (dataset sample {sample_idx})")
 
-        for qa in sample.qa:
+        qa_progress = tqdm(sample.qa, desc=f"QA {sample_idx}", unit="qa", leave=False)
+        for qa in qa_progress:
             if int(qa.category) in allow_categories:
                 total_questions += 1
+                qa_progress.set_postfix_str(f"global={total_questions}/{total_qas_in_run} cat={qa.category}")
                 category_counts[qa.category] += 1
 
                 prediction, user_prompt, raw_context = agent.answer_question(
@@ -285,6 +342,8 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                     "prediction": prediction,
                     "reference": qa.final_answer,
                     "category": qa.category,
+                    "user_prompt": user_prompt,
+                    "raw_context": raw_context,
                     "metrics": metrics,
                 }
                 results.append(result)
@@ -329,6 +388,115 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     return final_results
 
 
+def _worker_output_path(output_path: Optional[str], worker_id: int) -> Optional[str]:
+    if not output_path:
+        return None
+    output = Path(output_path)
+    suffix = output.suffix or ".json"
+    stem = output.stem if output.suffix else output.name
+    return str(output.with_name(f"{stem}.worker_{worker_id}{suffix}"))
+
+
+def _merge_batch_results(worker_results: List[Dict]) -> Dict:
+    category_counts = defaultdict(int)
+    all_metrics = []
+    all_categories = []
+    individual_results = []
+    total_questions = 0
+    model = worker_results[0].get("model") if worker_results else None
+    dataset = worker_results[0].get("dataset") if worker_results else None
+    memory_layer = worker_results[0].get("memory_layer", "robust") if worker_results else "robust"
+
+    for result in worker_results:
+        total_questions += result.get("total_questions", 0)
+        for category, count in result.get("category_distribution", {}).items():
+            category_counts[int(category)] += count
+        worker_items = result.get("individual_results", [])
+        individual_results.extend(worker_items)
+        for item in worker_items:
+            metrics = item.get("metrics")
+            category = item.get("category")
+            if metrics is not None and category is not None:
+                all_metrics.append(metrics)
+                all_categories.append(category)
+
+    aggregate_results = aggregate_metrics(all_metrics, all_categories) if all_metrics else {}
+    return {
+        "model": model,
+        "dataset": dataset,
+        "memory_layer": memory_layer,
+        "total_questions": total_questions,
+        "category_distribution": {str(cat): count for cat, count in sorted(category_counts.items())},
+        "aggregate_metrics": aggregate_results,
+        "individual_results": individual_results,
+    }
+
+
+def run_batch_workers(args, dataset_path: str, output_path: Optional[str]) -> Dict:
+    if args.batch < 1:
+        raise ValueError("batch must be at least 1")
+
+    child_base = [
+        sys.executable,
+        os.path.abspath(__file__),
+        "--dataset", args.dataset,
+        "--model", args.model,
+        "--ratio", str(args.ratio),
+        "--backend", args.backend,
+        "--temperature_c5", str(args.temperature_c5),
+        "--retrieve_k", str(args.retrieve_k),
+        "--sglang_host", args.sglang_host,
+        "--sglang_port", str(args.sglang_port),
+        "--start_sample", str(args.start_sample),
+        "--num_workers", str(args.batch),
+    ]
+    if args.end_sample is not None:
+        child_base.extend(["--end_sample", str(args.end_sample)])
+    if args.sample_ids:
+        child_base.extend(["--sample-ids", args.sample_ids])
+    if args.api_key is not None:
+        child_base.extend(["--api_key", args.api_key])
+    if args.api_base is not None:
+        child_base.extend(["--api_base", args.api_base])
+
+    processes = []
+    worker_outputs = []
+    for worker_id in range(args.batch):
+        worker_output = _worker_output_path(output_path, worker_id)
+        cmd = child_base + ["--worker_id", str(worker_id)]
+        if worker_output is not None:
+            rel_worker_output = os.path.relpath(worker_output, os.path.dirname(__file__))
+            cmd.extend(["--output", rel_worker_output])
+        logger.info("launching worker_id=%s command=%s", worker_id, cmd)
+        processes.append((worker_id, worker_output, subprocess.Popen(cmd, cwd=os.path.dirname(__file__))))
+        worker_outputs.append(worker_output)
+
+    failures = []
+    for worker_id, worker_output, process in processes:
+        return_code = process.wait()
+        if return_code != 0:
+            failures.append((worker_id, return_code))
+        else:
+            logger.info("worker_id=%s completed output=%s", worker_id, worker_output)
+
+    if failures:
+        failed = ", ".join(f"worker {worker_id} (exit {return_code})" for worker_id, return_code in failures)
+        raise RuntimeError(f"batch run failed: {failed}")
+
+    worker_results = []
+    for worker_output in worker_outputs:
+        if worker_output is None:
+            continue
+        with open(worker_output, "r", encoding="utf-8") as f:
+            worker_results.append(json.load(f))
+
+    merged_result = _merge_batch_results(worker_results)
+    if output_path:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(merged_result, f, indent=2)
+    return merged_result
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Evaluate robust text-only agent on LoComo dataset (no JSON schema dependency)"
@@ -351,18 +519,50 @@ def main():
                         help="SGLang server host (for sglang backend)")
     parser.add_argument("--sglang_port", type=int, default=30000,
                         help="SGLang server port (for sglang backend)")
+    parser.add_argument("--api_key", type=str, default=None,
+                        help="OpenAI-compatible API key. Defaults to environment variables.")
+    parser.add_argument("--api_base", type=str, default=None,
+                        help="OpenAI-compatible API base or full /chat/completions endpoint.")
+    parser.add_argument("--start_sample", type=int, default=0,
+                        help="Inclusive start sample index after applying ratio")
+    parser.add_argument("--end_sample", type=int, default=None,
+                        help="Exclusive end sample index after applying ratio")
+    parser.add_argument("--num_workers", type=int, default=1,
+                        help="Total number of workers for manual sharding")
+    parser.add_argument("--worker_id", type=int, default=0,
+                        help="Worker id for manual sharding")
+    parser.add_argument("--batch", type=int, default=None,
+                        help="Launch this many worker processes and merge outputs")
+    parser.add_argument("--sample-ids", type=str, default=None,
+                        help="Comma-separated dataset sample ids to evaluate")
     args = parser.parse_args()
+    load_dotenv(override=True)
+    args.api_base = resolve_api_base(args.api_base)
 
     if args.ratio <= 0.0 or args.ratio > 1.0:
         raise ValueError("Ratio must be between 0.0 and 1.0")
 
     dataset_path = os.path.join(os.path.dirname(__file__), args.dataset)
     output_path = os.path.join(os.path.dirname(__file__), args.output) if args.output else None
+    sample_ids = None
+    if args.sample_ids:
+        sample_ids = [int(part.strip()) for part in args.sample_ids.split(",") if part.strip()]
+
+    if args.batch is not None:
+        if args.batch == 1:
+            args.num_workers = 1
+            args.worker_id = 0
+        else:
+            run_batch_workers(args, dataset_path, output_path)
+            return
 
     evaluate_dataset(
         dataset_path, args.model, output_path, args.ratio,
         args.backend, args.temperature_c5, args.retrieve_k,
         args.sglang_host, args.sglang_port,
+        args.api_key, args.api_base,
+        args.start_sample, args.end_sample,
+        args.num_workers, args.worker_id, sample_ids,
     )
 
 

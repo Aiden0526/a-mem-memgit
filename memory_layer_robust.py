@@ -18,15 +18,20 @@ import os
 import time
 import logging
 import functools
+import hashlib
 from datetime import datetime
 from abc import ABC, abstractmethod
 
 from memory_layer import SimpleEmbeddingRetriever, simple_tokenize
 from llm_text_parsers import (
     ANALYZE_CONTENT_PROMPT,
+    ANALYZE_CONTENT_PREF_PROMPT,
     EVOLUTION_DECISION_PROMPT,
+    EVOLUTION_DECISION_PREF_PROMPT,
     STRENGTHEN_DETAILS_PROMPT,
+    STRENGTHEN_DETAILS_PREF_PROMPT,
     UPDATE_NEIGHBORS_PROMPT,
+    UPDATE_NEIGHBORS_PREF_PROMPT,
     FOCUSED_KEYWORDS_PROMPT,
     parse_analyze_content,
     parse_evolution_decision,
@@ -36,6 +41,31 @@ from llm_text_parsers import (
 )
 
 logger = logging.getLogger("amem_robust")
+
+
+def normalize_openai_compatible_base_url(api_base: Optional[str]) -> Optional[str]:
+    """
+    Normalize an OpenAI-compatible base URL.
+
+    Accepts either an API root such as:
+      https://host/v1
+    or a full chat completions endpoint such as:
+      https://host/v1/chat/completions
+
+    Returns the API root expected by the OpenAI client / LiteLLM.
+    """
+    if api_base is None:
+        return None
+
+    normalized = api_base.strip().rstrip("/")
+    if not normalized:
+        return None
+
+    suffix = "/chat/completions"
+    if normalized.endswith(suffix):
+        normalized = normalized[: -len(suffix)]
+
+    return normalized
 
 # ---------------------------------------------------------------------------
 # Retry decorator
@@ -102,16 +132,34 @@ class RobustOpenAIController(RobustBaseLLMController):
             raise ImportError("OpenAI package not found. Install it with: pip install openai")
         self.model = model
         if api_key is None:
-            api_key = os.getenv('OPENAI_API_KEY')
+            api_key = (
+                os.getenv('OPENAI_API_KEY')
+                or os.getenv('PPAPI_API_KEY')
+                or os.getenv('OPENAI_KEY')
+            )
         if api_key is None:
-            raise ValueError("OpenAI API key not found. Set OPENAI_API_KEY environment variable.")
+            raise ValueError(
+                "OpenAI-compatible API key not found. Set OPENAI_API_KEY or PPAPI_API_KEY."
+            )
         client_kwargs = {"api_key": api_key}
-        if api_base:
-            client_kwargs["base_url"] = api_base
+        normalized_api_base = normalize_openai_compatible_base_url(
+            api_base or os.getenv("OPENAI_BASE_URL") or os.getenv("PPAPI_BASE_URL")
+        )
+        if normalized_api_base:
+            client_kwargs["base_url"] = normalized_api_base
         self.client = OpenAI(**client_kwargs)
+        self.base_url = normalized_api_base or "https://api.openai.com/v1"
+        logger.info("RobustOpenAIController initialized model=%s base_url=%s", self.model, self.base_url)
 
     @retry_llm_call(max_retries=2)
-    def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
+    def get_completion(self, prompt: str, temperature: float = 0.7, max_tokens: int = 1000) -> str:
+        prompt_digest = hashlib.md5(prompt.encode("utf-8")).hexdigest()[:8]
+        prompt_preview = " ".join(prompt.strip().split())[:120]
+        start_time = time.time()
+        logger.info(
+            "LLM request start model=%s digest=%s prompt_chars=%d temperature=%.2f max_tokens=%d preview=%r",
+            self.model, prompt_digest, len(prompt), temperature, max_tokens, prompt_preview,
+        )
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
@@ -119,9 +167,16 @@ class RobustOpenAIController(RobustBaseLLMController):
                 {"role": "user", "content": prompt}
             ],
             temperature=temperature,
-            max_completion_tokens=1000,
+            max_completion_tokens=max_tokens,
+            timeout=180.0,
         )
-        return response.choices[0].message.content
+        elapsed = time.time() - start_time
+        content = response.choices[0].message.content
+        logger.info(
+            "LLM request done model=%s digest=%s elapsed=%.2fs response_chars=%d",
+            self.model, prompt_digest, elapsed, len(content or ""),
+        )
+        return content
 
 
 class RobustOllamaController(RobustBaseLLMController):
@@ -217,8 +272,14 @@ class RobustLiteLLMController(RobustBaseLLMController):
         from litellm import completion as _completion
         self._completion = _completion
         self.model = model
-        self.api_base = api_base
-        self.api_key = api_key or "EMPTY"
+        self.api_base = normalize_openai_compatible_base_url(api_base)
+        self.api_key = (
+            api_key
+            or os.getenv("OPENAI_API_KEY")
+            or os.getenv("PPAPI_API_KEY")
+            or os.getenv("OPENAI_KEY")
+            or "EMPTY"
+        )
 
     @retry_llm_call(max_retries=2)
     def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
@@ -295,16 +356,46 @@ class RobustMemoryNote:
                  evolution_history: Optional[List] = None,
                  category: Optional[str] = None,
                  tags: Optional[List[str]] = None,
-                 llm_controller: Optional[RobustLLMController] = None):
+                 llm_controller: Optional[RobustLLMController] = None,
+                 is_preference: bool = False,
+                 pref_domain: str = "",
+                 pref_holder: str = "none",
+                 change_type: str = "none",
+                 analyze_prompt: Optional[str] = None):
 
         self.content = content
 
         if llm_controller and any(p is None for p in [keywords, context, category, tags]):
-            analysis = self.analyze_content(content, llm_controller)
+            analysis = self.analyze_content(content, llm_controller, analyze_prompt)
             logger.debug("analysis result: %s", analysis)
             keywords = keywords or analysis["keywords"]
             context = context or analysis["context"]
             tags = tags or analysis["tags"]
+            # Preference metadata from analysis (only override if not explicitly passed)
+            if not is_preference:
+                is_preference = analysis.get("is_preference", False)
+            if not pref_domain:
+                pref_domain = analysis.get("pref_domain", "")
+            if pref_holder == "none":
+                pref_holder = analysis.get("pref_holder", "none")
+            if change_type == "none":
+                change_type = analysis.get("change_type", "none")
+            # Validate ask_to_forget: must be an explicit imperative command directed at the assistant.
+            # Narratives like "I used to like X but now prefer Y" are NOT ask_to_forget.
+            if change_type == "ask_to_forget":
+                _forget_imperatives = [
+                    "forget", "stop treating", "ignore", "remove",
+                    "don't consider", "do not consider", "no longer consider",
+                    "don't remember", "do not remember", "don't keep", "don't store",
+                    "please don't", "stop remembering",
+                ]
+                _content_lower = content.lower()
+                if not any(imp in _content_lower for imp in _forget_imperatives):
+                    # Downgrade: if a new preference is stated, it's a replacement; otherwise a flip
+                    if any(w in _content_lower for w in ["prefer", "like", "love", "enjoy", "switched", "moved on", "into"]):
+                        change_type = "object_replacement"
+                    else:
+                        change_type = "same_object_flip"
 
         self.id = id or str(uuid.uuid4())
         self.keywords = keywords or []
@@ -323,10 +414,16 @@ class RobustMemoryNote:
         self.category = category or "Uncategorized"
         self.tags = tags or []
 
+        # Preference metadata
+        self.is_preference: bool = is_preference
+        self.pref_domain: str = pref_domain or ""
+        self.pref_holder: str = pref_holder or "none"
+        self.change_type: str = change_type or "none"
+
     @staticmethod
-    def analyze_content(content: str, llm_controller: RobustLLMController) -> Dict:
+    def analyze_content(content: str, llm_controller: RobustLLMController, analyze_prompt: str = None) -> Dict:
         """Analyze content using plain-text prompt + section-marker parsing."""
-        prompt = ANALYZE_CONTENT_PROMPT.format(content=content)
+        prompt = (analyze_prompt or ANALYZE_CONTENT_PROMPT).format(content=content)
         try:
             response = llm_controller.llm.get_completion(prompt)
             analysis = parse_analyze_content(response, content)
@@ -370,7 +467,9 @@ class RobustAgenticMemorySystem:
                  api_base: Optional[str] = None,
                  sglang_host: str = "http://localhost",
                  sglang_port: int = 30000,
-                 check_connection: bool = False):
+                 check_connection: bool = False,
+                 preference_aware: Optional[bool] = None,
+                 preference_aware_level: Optional[str] = None):
 
         self.memories: Dict[str, RobustMemoryNote] = {}
         self.retriever = SimpleEmbeddingRetriever(model_name)
@@ -381,6 +480,28 @@ class RobustAgenticMemorySystem:
         self.evo_cnt = 0
         self.evo_threshold = evo_threshold
 
+        # Resolve preference_aware_level. Accept the legacy `preference_aware`
+        # bool kwarg and map it to the equivalent level for backward compat.
+        if preference_aware_level is None:
+            if preference_aware is True:
+                preference_aware_level = "full"
+            else:
+                preference_aware_level = "none"
+        if preference_aware_level not in ("none", "patch_only", "full"):
+            raise ValueError(
+                f"preference_aware_level must be one of none|patch_only|full, got {preference_aware_level!r}"
+            )
+        self.preference_aware_level = preference_aware_level
+        self.preference_aware = preference_aware_level != "none"
+
+        use_pref_analyze = preference_aware_level in ("patch_only", "full")
+        use_pref_graph = preference_aware_level == "full"
+
+        self._analyze_prompt = ANALYZE_CONTENT_PREF_PROMPT if use_pref_analyze else ANALYZE_CONTENT_PROMPT
+        self._evolution_prompt = EVOLUTION_DECISION_PREF_PROMPT if use_pref_graph else EVOLUTION_DECISION_PROMPT
+        self._strengthen_prompt = STRENGTHEN_DETAILS_PREF_PROMPT if use_pref_graph else STRENGTHEN_DETAILS_PROMPT
+        self._update_neighbors_prompt = UPDATE_NEIGHBORS_PREF_PROMPT if use_pref_graph else UPDATE_NEIGHBORS_PROMPT
+
     # ---- public API (mirrors AgenticMemorySystem) ----
 
     def add_note(self, content: str, time: str = None, **kwargs) -> str:
@@ -389,6 +510,7 @@ class RobustAgenticMemorySystem:
             content=content,
             llm_controller=self.llm_controller,
             timestamp=time,
+            analyze_prompt=self._analyze_prompt,
             **kwargs,
         )
         evo_label, note = self.process_memory(note)
@@ -411,6 +533,7 @@ class RobustAgenticMemorySystem:
             content=content,
             llm_controller=self.llm_controller,
             timestamp=time,
+            analyze_prompt=self._analyze_prompt,
             **kwargs,
         )
         evo_label, note, trace = self.process_memory_with_trace(note)
@@ -506,12 +629,13 @@ class RobustAgenticMemorySystem:
 
         try:
             # ---- Call 1: Evolution decision ----
-            decision_prompt = EVOLUTION_DECISION_PROMPT.format(
+            decision_prompt = self._evolution_prompt.format(
                 context=note.context,
                 content=note.content,
                 keywords=note.keywords,
                 nearest_neighbors_memories=neighbor_memory,
             )
+            logger.info("process_memory note=%s stage=evolution_decision neighbors=%d", note.id, len(indices))
             decision_response = self.llm_controller.llm.get_completion(decision_prompt)
             decision = parse_evolution_decision(decision_response)
             logger.debug("Evolution decision: %s", decision)
@@ -524,11 +648,12 @@ class RobustAgenticMemorySystem:
 
             # ---- Call 2: Strengthen details (conditional) ----
             if should_strengthen:
-                strengthen_prompt = STRENGTHEN_DETAILS_PROMPT.format(
+                strengthen_prompt = self._strengthen_prompt.format(
                     content=note.content,
                     keywords=note.keywords,
                     nearest_neighbors_memories=neighbor_memory,
                 )
+                logger.info("process_memory note=%s stage=strengthen_details", note.id)
                 strengthen_response = self.llm_controller.llm.get_completion(strengthen_prompt)
                 strengthen = parse_strengthen_details(strengthen_response)
                 logger.debug("Strengthen details: %s", strengthen)
@@ -539,13 +664,14 @@ class RobustAgenticMemorySystem:
 
             # ---- Call 3: Update neighbors (conditional) ----
             if should_update:
-                update_prompt = UPDATE_NEIGHBORS_PROMPT.format(
+                update_prompt = self._update_neighbors_prompt.format(
                     content=note.content,
                     context=note.context,
                     nearest_neighbors_memories=neighbor_memory,
                     max_neighbor_idx=len(indices) - 1,
                     neighbor_count=len(indices),
                 )
+                logger.info("process_memory note=%s stage=update_neighbors", note.id)
                 update_response = self.llm_controller.llm.get_completion(update_prompt)
                 neighbor_updates = parse_update_neighbors(update_response, len(indices))
                 logger.debug("Neighbor updates: %s", neighbor_updates)
@@ -591,7 +717,7 @@ class RobustAgenticMemorySystem:
             return False, note, trace
 
         try:
-            decision_prompt = EVOLUTION_DECISION_PROMPT.format(
+            decision_prompt = self._evolution_prompt.format(
                 context=note.context,
                 content=note.content,
                 keywords=note.keywords,
@@ -611,7 +737,7 @@ class RobustAgenticMemorySystem:
             should_update = decision["decision"] in ("UPDATE_NEIGHBOR", "STRENGTHEN_AND_UPDATE")
 
             if should_strengthen:
-                strengthen_prompt = STRENGTHEN_DETAILS_PROMPT.format(
+                strengthen_prompt = self._strengthen_prompt.format(
                     content=note.content,
                     keywords=note.keywords,
                     nearest_neighbors_memories=neighbor_memory,
@@ -628,7 +754,7 @@ class RobustAgenticMemorySystem:
                     note.tags = strengthen["tags"]
 
             if should_update:
-                update_prompt = UPDATE_NEIGHBORS_PROMPT.format(
+                update_prompt = self._update_neighbors_prompt.format(
                     content=note.content,
                     context=note.context,
                     nearest_neighbors_memories=neighbor_memory,

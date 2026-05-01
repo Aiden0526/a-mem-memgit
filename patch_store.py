@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -72,6 +73,37 @@ class PatchStore:
             return None
         return json.loads(patch_path.read_text(encoding="utf-8"))
 
+    def clear_patch_data(self, sample_id: str) -> None:
+        """Delete all patch-specific files for a sample, keeping the global graph intact."""
+        sample_dir = self.root_dir / f"sample_{sample_id}"
+        if not sample_dir.exists():
+            return
+        # Remove patch index
+        idx_path = self.patch_index_records_path(sample_id)
+        if idx_path.exists():
+            idx_path.unlink()
+        # Remove patch retriever cache
+        pkl, npy = self.patch_retriever_paths(sample_id)
+        for p in (pkl, npy):
+            if Path(p).exists():
+                Path(p).unlink()
+        # Remove individual patch JSON files
+        patches_dir = sample_dir / "patches"
+        if patches_dir.exists():
+            shutil.rmtree(patches_dir)
+
+    def clear_global_graph_cache(self, sample_id: str) -> None:
+        """Delete global-graph cache artifacts for a sample."""
+        sample_dir = self.root_dir / f"sample_{sample_id}"
+        if not sample_dir.exists():
+            return
+        graph_dir = sample_dir / "global_graph"
+        if graph_dir.exists():
+            shutil.rmtree(graph_dir)
+        build_status_path = self.build_status_path(sample_id)
+        if build_status_path.exists():
+            build_status_path.unlink()
+
     def load_all_patches(self, sample_id: str) -> List[Dict]:
         records = []
         for patch_path in sorted(self.patches_dir(sample_id).glob("patch_*.json")):
@@ -94,3 +126,10 @@ class PatchStore:
                 if line:
                     records.append(json.loads(line))
         return records
+
+
+    def save_patch_index_records(self, sample_id: str, records: List[Dict]) -> None:
+        path = self.patch_index_records_path(sample_id)
+        with path.open("w", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")

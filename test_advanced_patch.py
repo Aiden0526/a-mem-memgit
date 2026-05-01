@@ -1,8 +1,8 @@
 """Evaluation harness for patch-augmented A-Mem."""
 
-from memory_layer_robust import RobustLLMController
+from memory_layer_robust import RobustLLMController, normalize_openai_compatible_base_url
 from memory_layer_patch import PatchAugmentedMemorySystem, PatchConfig
-from llm_text_parsers import parse_keywords_response
+from llm_text_parsers import parse_keywords_response, parse_plain_text_answer
 import argparse
 import json
 import logging
@@ -11,16 +11,55 @@ import random
 import subprocess
 import sys
 from collections import defaultdict
+from dotenv import load_dotenv
 from datetime import datetime
+from pathlib import Path
+from tqdm.auto import tqdm
 from load_dataset import load_locomo_dataset
+from utils import calculate_metrics, aggregate_metrics
 
 logger = logging.getLogger("amem_patch")
+
+DEFAULT_PPAPI_CHAT_COMPLETIONS_URL = "https://app.ppapi.ai/v1/chat/completions"
+
+
+def setup_logging(log_file: str | None, level: str = "INFO") -> None:
+    root = logging.getLogger()
+    root.handlers.clear()
+    resolved_level = getattr(logging, level.upper(), logging.INFO)
+    root.setLevel(resolved_level)
+    formatter = logging.Formatter("%(asctime)s - %(process)d - %(name)s - %(levelname)s - %(message)s")
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    root.addHandler(stream_handler)
+
+    if log_file:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_path)
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+
+
+def resolve_api_base(api_base: str | None) -> str | None:
+    if api_base:
+        return normalize_openai_compatible_base_url(api_base)
+    return normalize_openai_compatible_base_url(
+        os.getenv("OPENAI_BASE_URL")
+        or os.getenv("PPAPI_BASE_URL")
+        or DEFAULT_PPAPI_CHAT_COMPLETIONS_URL
+    )
 
 
 class PatchAdvancedMemAgent:
     def __init__(self, model, backend, retrieve_k, temperature_c5,
                  sglang_host="http://localhost", sglang_port=30000,
-                 patch_top_k=2, api_key=None, api_base=None):
+                 patch_top_k=2, patch_usage="always", api_key=None, api_base=None,
+                 min_patch_similarity=0.0, patch_node_rerank=False, patch_node_top_k=2,
+                 patch_node_query_mode="expanded", patch_hybrid_retrieval=False,
+                 patch_hybrid_alpha=0.7, patch_hybrid_node_rerank=False,
+                 cache_root=None):
         self.memory_system = PatchAugmentedMemorySystem(
             sample_id="0",
             model_name='all-MiniLM-L6-v2',
@@ -30,9 +69,18 @@ class PatchAdvancedMemAgent:
             api_base=api_base,
             sglang_host=sglang_host,
             sglang_port=sglang_port,
+            store_root=cache_root,
             config=PatchConfig(
                 patch_top_k=patch_top_k,
                 retrieve_k_current=retrieve_k,
+                patch_usage=patch_usage,
+                min_patch_similarity=min_patch_similarity,
+                patch_node_rerank=patch_node_rerank,
+                patch_node_top_k=patch_node_top_k,
+                patch_node_query_mode=patch_node_query_mode,
+                patch_hybrid_retrieval=patch_hybrid_retrieval,
+                patch_hybrid_alpha=patch_hybrid_alpha,
+                patch_hybrid_node_rerank=patch_hybrid_node_rerank,
             ),
         )
         self.retriever_llm = RobustLLMController(
@@ -62,6 +110,8 @@ Keywords:"""
         return parse_keywords_response(response)
 
     def answer_question(self, question: str, category: int, answer: str):
+        if self.memory_system.config.patch_usage == "gated":
+            return self.memory_system.answer_with_patch_history_gated(question, category, answer)
         return self.memory_system.answer_with_patch_history(question, category, answer)
 
 
@@ -70,16 +120,35 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
                      retrieve_k: int = 10, patch_top_k: int = 5,
                      sglang_host: str = "http://localhost", sglang_port: int = 30000,
                      max_samples: int | None = None,
+                     start_sample: int = 0,
+                     end_sample: int | None = None,
                      num_workers: int = 1,
                      worker_id: int = 0,
                      skip_qa: bool = False,
                      api_key: str | None = None,
                      api_base: str | None = None,
-                     inventory_output: str | None = None):
+                     inventory_output: str | None = None,
+                     patch_usage: str = "always",
+                     min_patch_similarity: float = 0.0,
+                     patch_node_rerank: bool = False,
+                     patch_node_top_k: int = 2,
+                     patch_node_query_mode: str = "expanded",
+                     patch_hybrid_retrieval: bool = False,
+                     patch_hybrid_alpha: float = 0.7,
+                     patch_hybrid_node_rerank: bool = False,
+                     cache_root: str | None = None,
+                     log_file: str | None = None):
+    if log_file:
+        logger.info("logging to %s", log_file)
     samples = load_locomo_dataset(dataset_path)
     if ratio < 1.0:
         num_samples = max(1, int(len(samples) * ratio))
         samples = samples[:num_samples]
+    if start_sample < 0:
+        raise ValueError("start_sample must be >= 0")
+    if end_sample is not None and end_sample < start_sample:
+        raise ValueError("end_sample must be >= start_sample")
+    samples = samples[start_sample:end_sample]
     if max_samples is not None:
         samples = samples[:max_samples]
     if num_workers < 1:
@@ -90,18 +159,36 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
         samples = [sample for sample_idx, sample in enumerate(samples)
                    if sample_idx % num_workers == worker_id]
 
-    agent = PatchAdvancedMemAgent(model, backend, retrieve_k, temperature_c5,
-                                  sglang_host, sglang_port, patch_top_k, api_key, api_base)
+    agent = PatchAdvancedMemAgent(
+        model, backend, retrieve_k, temperature_c5,
+        sglang_host, sglang_port, patch_top_k, patch_usage, api_key, api_base,
+        min_patch_similarity=min_patch_similarity,
+        patch_node_rerank=patch_node_rerank,
+        patch_node_top_k=patch_node_top_k,
+        patch_node_query_mode=patch_node_query_mode,
+        patch_hybrid_retrieval=patch_hybrid_retrieval,
+        patch_hybrid_alpha=patch_hybrid_alpha,
+        patch_hybrid_node_rerank=patch_hybrid_node_rerank,
+        cache_root=cache_root,
+    )
     category_counts = defaultdict(int)
+    all_metrics = []
+    all_categories = []
+    total_questions = 0
+    total_qas_in_run = sum(len(sample.qa) for sample in samples) if not skip_qa else 0
 
     sample_patch_summaries = []
     qa_results = []
 
-    for sample_idx, sample in enumerate(samples):
+    sample_progress = tqdm(samples, desc="Samples", unit="sample")
+    for sample_idx, sample in enumerate(sample_progress):
+        sample_progress.set_postfix_str(f"sample_id={sample.sample_id}")
         agent.set_sample(sample.sample_id)
         if agent.memory_system.has_complete_global_graph_cache():
             logger.info("sample=%s loaded complete global graph cache; skipping rebuild", sample.sample_id)
         else:
+            total_turns = sum(len(turns.turns) for turns in sample.conversation.sessions.values())
+            turn_progress = tqdm(total=total_turns, desc=f"Build {sample.sample_id}", unit="turn", leave=False)
             for session_id, turns in sample.conversation.sessions.items():
                 for turn_position, turn in enumerate(turns.turns):
                     conversation_tmp = "Speaker " + turn.speaker + " says : " + turn.text
@@ -116,6 +203,8 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
                         dia_id=turn.dia_id,
                         speaker=turn.speaker,
                     )
+                    turn_progress.update(1)
+            turn_progress.close()
             agent.memory_system.mark_sample_complete()
 
         patch_summary = agent.memory_system.summarize_patch_inventory()
@@ -139,11 +228,32 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
         if skip_qa:
             continue
 
-        for qa_idx, qa in enumerate(sample.qa):
+        qa_progress = tqdm(sample.qa, desc=f"QA {sample.sample_id}", unit="qa", leave=False)
+        for qa_idx, qa in enumerate(qa_progress):
+            total_questions += 1
+            qa_progress.set_postfix_str(f"global={total_questions}/{total_qas_in_run} cat={qa.category}")
+            logger.info(
+                "qa_progress sample=%s qa=%s/%s sample_qa=%s/%s category=%s question=%s",
+                sample.sample_id,
+                total_questions,
+                total_qas_in_run,
+                qa_idx + 1,
+                len(sample.qa),
+                qa.category,
+                qa.question,
+            )
             category_counts[qa.category] += 1
-            prediction, user_prompt, raw_context = agent.answer_question(
+            prediction, user_prompt, raw_context, answer_metadata = agent.answer_question(
                 qa.question, qa.category, qa.final_answer
             )
+            prediction = parse_plain_text_answer(prediction)
+            metrics = calculate_metrics(prediction, qa.final_answer) if qa.final_answer else {
+                "exact_match": 0, "f1": 0.0, "rouge1_f": 0.0, "rouge2_f": 0.0,
+                "rougeL_f": 0.0, "bleu1": 0.0, "bleu2": 0.0, "bleu3": 0.0,
+                "bleu4": 0.0, "bert_f1": 0.0, "meteor": 0.0, "sbert_similarity": 0.0
+            }
+            all_metrics.append(metrics)
+            all_categories.append(qa.category)
             qa_results.append({
                 "sample_index": sample_idx,
                 "sample_id": sample.sample_id,
@@ -154,14 +264,25 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
                 "reference": qa.final_answer,
                 "user_prompt": user_prompt,
                 "raw_context": raw_context,
+                "metrics": metrics,
+                "answer_metadata": answer_metadata,
             })
             logger.info("sample=%s category=%s question=%s prediction=%s", sample_idx, qa.category, qa.question, prediction)
             logger.debug("prompt=%s", user_prompt)
             logger.debug("context=%s", raw_context)
+        qa_progress.close()
 
+    sample_progress.close()
+    aggregate_results = aggregate_metrics(all_metrics, all_categories) if all_metrics else {}
     result = {
+        "model": model,
+        "dataset": dataset_path,
+        "memory_layer": "patch",
+        "patch_usage": patch_usage,
         "samples": len(samples),
+        "total_questions": total_questions,
         "category_counts": dict(category_counts),
+        "aggregate_metrics": aggregate_results,
         "sample_patch_summaries": sample_patch_summaries,
         "qa_results": qa_results,
     }
@@ -183,16 +304,39 @@ def _merge_inventory_results(worker_results: list[dict]) -> dict:
     category_counts = defaultdict(int)
     sample_patch_summaries = []
     qa_results = []
+    all_metrics = []
+    all_categories = []
     total_samples = 0
+    total_questions = 0
+    model = worker_results[0].get("model") if worker_results else None
+    dataset = worker_results[0].get("dataset") if worker_results else None
+    patch_usage = worker_results[0].get("patch_usage", "always") if worker_results else "always"
     for result in worker_results:
         total_samples += result.get("samples", 0)
+        total_questions += result.get("total_questions", 0)
         for category, count in result.get("category_counts", {}).items():
             category_counts[int(category)] += count
         sample_patch_summaries.extend(result.get("sample_patch_summaries", []))
+        worker_qa_results = result.get("qa_results", [])
+        qa_results.extend(worker_qa_results)
+        for qa_result in worker_qa_results:
+            metrics = qa_result.get("metrics")
+            category = qa_result.get("category")
+            if metrics is not None and category is not None:
+                all_metrics.append(metrics)
+                all_categories.append(category)
+    aggregate_results = aggregate_metrics(all_metrics, all_categories) if all_metrics else {}
     return {
+        "model": model,
+        "dataset": dataset,
+        "memory_layer": "patch",
+        "patch_usage": patch_usage,
         "samples": total_samples,
+        "total_questions": total_questions,
         "category_counts": dict(category_counts),
+        "aggregate_metrics": aggregate_results,
         "sample_patch_summaries": sample_patch_summaries,
+        "qa_results": qa_results,
     }
 
 
@@ -209,16 +353,30 @@ def run_batch_workers(args) -> dict:
         "--ratio", str(args.ratio),
         "--retrieve_k", str(args.retrieve_k),
         "--patch_top_k", str(args.patch_top_k),
+        "--patch_usage", args.patch_usage,
         "--temperature_c5", str(args.temperature_c5),
+        "--min_patch_similarity", str(args.min_patch_similarity),
+        "--patch_node_top_k", str(args.patch_node_top_k),
+        "--patch_node_query_mode", args.patch_node_query_mode,
+        "--patch_hybrid_alpha", str(args.patch_hybrid_alpha),
         "--sglang_host", args.sglang_host,
         "--sglang_port", str(args.sglang_port),
+        "--start_sample", str(args.start_sample),
         "--num_workers", str(args.batch),
     ]
 
+    if args.end_sample is not None:
+        child_base.extend(["--end_sample", str(args.end_sample)])
     if args.max_samples is not None:
         child_base.extend(["--max_samples", str(args.max_samples)])
     if args.skip_qa:
         child_base.append("--skip_qa")
+    if args.patch_node_rerank:
+        child_base.append("--patch_node_rerank")
+    if args.patch_hybrid_retrieval:
+        child_base.append("--patch_hybrid_retrieval")
+    if args.patch_hybrid_node_rerank:
+        child_base.append("--patch_hybrid_node_rerank")
     if args.api_key is not None:
         child_base.extend(["--api_key", args.api_key])
     if args.api_base is not None:
@@ -231,6 +389,8 @@ def run_batch_workers(args) -> dict:
         cmd = child_base + ["--worker_id", str(worker_id)]
         if worker_output is not None:
             cmd.extend(["--inventory_output", worker_output])
+        if args.cache_root:
+            cmd.extend(["--cache_root", args.cache_root])
         logger.info("launching worker_id=%s command=%s", worker_id, cmd)
         processes.append((worker_id, worker_output, subprocess.Popen(cmd)))
         worker_outputs.append(worker_output)
@@ -263,27 +423,53 @@ def run_batch_workers(args) -> dict:
 
 
 if __name__ == "__main__":
+    load_dotenv(override=True)
+
     parser = argparse.ArgumentParser(description="Patch-augmented A-Mem evaluation")
     parser.add_argument("--dataset", type=str, default="data/locomo10.json")
-    parser.add_argument("--model", type=str, default="gemini3-flash-preview")
-    parser.add_argument("--backend", type=str, default="openrouter")
+    parser.add_argument("--model", type=str, default="gpt-4o-mini")
+    parser.add_argument("--backend", type=str, default="openai", choices=["openai", "openrouter", "ollama", "sglang", "vllm"])
     parser.add_argument("--ratio", type=float, default=0.1)
     parser.add_argument("--retrieve_k", type=int, default=10)
     parser.add_argument("--patch_top_k", type=int, default=2)
+    parser.add_argument("--patch_usage", type=str, default="always", choices=["always", "gated"])
+    parser.add_argument("--min_patch_similarity", type=float, default=0.0)
+    parser.add_argument("--patch_node_rerank", action="store_true")
+    parser.add_argument("--patch_node_top_k", type=int, default=2)
+    parser.add_argument("--patch_node_query_mode", type=str, default="expanded",
+                        choices=["question_only", "keywords_only", "expanded", "answer_style"])
+    parser.add_argument("--patch_hybrid_retrieval", action="store_true")
+    parser.add_argument("--patch_hybrid_alpha", type=float, default=0.7)
+    parser.add_argument("--patch_hybrid_node_rerank", action="store_true")
     parser.add_argument("--temperature_c5", type=float, default=0.5)
     parser.add_argument("--sglang_host", type=str, default="http://localhost")
     parser.add_argument("--sglang_port", type=int, default=30000)
     parser.add_argument("--max_samples", type=int, default=None)
+    parser.add_argument("--start_sample", type=int, default=0)
+    parser.add_argument("--end_sample", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--worker_id", type=int, default=0)
     parser.add_argument("--batch", type=int, default=None)
     parser.add_argument("--skip_qa", action="store_true")
     parser.add_argument("--api_key", type=str, default=None)
-    parser.add_argument("--api_base", type=str, default="https://openrouter.ai/api/v1")
+    parser.add_argument("--api_base", type=str, default=None,
+                        help="OpenAI-compatible API base or full /chat/completions endpoint. Defaults to OPENAI_BASE_URL, PPAPI_BASE_URL, or ppapi.")
     parser.add_argument("--inventory_output", type=str, default=None)
+    parser.add_argument("--output", type=str, default=None,
+                        help="Alias for --inventory_output.")
+    parser.add_argument("--cache_root", type=str, default=None)
+    parser.add_argument("--log_file", type=str, default=None)
+    parser.add_argument("--log_level", type=str, default="INFO")
     args = parser.parse_args()
+    if args.output and not args.inventory_output:
+        args.inventory_output = args.output
+    args.api_base = resolve_api_base(args.api_base)
 
-    logging.basicConfig(level=logging.INFO)
+    if args.log_file is None:
+        timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+        worker_suffix = f"_worker{args.worker_id}" if args.num_workers > 1 else ""
+        args.log_file = str(Path("logs") / f"eval_patch_{args.model}_{args.backend}_ratio{args.ratio}{worker_suffix}_{timestamp}.log")
+    setup_logging(args.log_file, args.log_level)
     if args.batch is not None:
         if args.batch == 1:
             args.num_workers = 1
@@ -303,10 +489,22 @@ if __name__ == "__main__":
         sglang_host=args.sglang_host,
         sglang_port=args.sglang_port,
         max_samples=args.max_samples,
+        start_sample=args.start_sample,
+        end_sample=args.end_sample,
         num_workers=args.num_workers,
         worker_id=args.worker_id,
         skip_qa=args.skip_qa,
         api_key=args.api_key,
         api_base=args.api_base,
         inventory_output=args.inventory_output,
+        cache_root=args.cache_root,
+        log_file=args.log_file,
+        patch_usage=args.patch_usage,
+        min_patch_similarity=args.min_patch_similarity,
+        patch_node_rerank=args.patch_node_rerank,
+        patch_node_top_k=args.patch_node_top_k,
+        patch_node_query_mode=args.patch_node_query_mode,
+        patch_hybrid_retrieval=args.patch_hybrid_retrieval,
+        patch_hybrid_alpha=args.patch_hybrid_alpha,
+        patch_hybrid_node_rerank=args.patch_hybrid_node_rerank,
     )
