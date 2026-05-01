@@ -170,20 +170,40 @@ Question: {question} Short answer:"""
         return response, user_prompt, raw_context
 
 
-def setup_logger(log_file: Optional[str] = None) -> logging.Logger:
+def setup_logger(log_file: Optional[str] = None, raw_llm_log_file: Optional[str] = None) -> logging.Logger:
     """Set up logging configuration."""
-    eval_logger = logging.getLogger('locomo_eval_robust')
-    eval_logger.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+    eval_logger = logging.getLogger('locomo_eval_robust')
+    backend_logger = logging.getLogger('amem_robust')
+    openai_logger = logging.getLogger('openai')
+
+    for named_logger in (eval_logger, backend_logger, openai_logger):
+        named_logger.setLevel(logging.INFO)
+        named_logger.propagate = False
+        named_logger.handlers.clear()
 
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
     eval_logger.addHandler(console_handler)
+    backend_logger.addHandler(console_handler)
+    openai_logger.addHandler(console_handler)
 
     if log_file:
         file_handler = logging.FileHandler(log_file)
         file_handler.setFormatter(formatter)
         eval_logger.addHandler(file_handler)
+        backend_logger.addHandler(file_handler)
+        openai_logger.addHandler(file_handler)
+
+    if raw_llm_log_file:
+        raw_logger = logging.getLogger('amem_robust_raw')
+        raw_logger.setLevel(logging.INFO)
+        raw_logger.propagate = False
+        raw_logger.handlers.clear()
+        raw_file_handler = logging.FileHandler(raw_llm_log_file)
+        raw_file_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+        raw_logger.addHandler(raw_file_handler)
 
     return eval_logger
 
@@ -195,7 +215,8 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                      api_key: Optional[str] = None, api_base: Optional[str] = None,
                      start_sample: int = 0, end_sample: Optional[int] = None,
                      num_workers: int = 1, worker_id: int = 0,
-                     sample_ids: Optional[List[int]] = None):
+                     sample_ids: Optional[List[int]] = None,
+                     raw_llm_log: Optional[str] = None):
     """Evaluate the robust agent on the LoComo dataset."""
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
     worker_suffix = f"_worker{worker_id}" if num_workers > 1 else ""
@@ -203,7 +224,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     log_path = os.path.join(os.path.dirname(__file__), "logs", log_filename)
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
 
-    eval_logger = setup_logger(log_path)
+    eval_logger = setup_logger(log_path, raw_llm_log)
     eval_logger.info(f"Loading dataset from {dataset_path}")
     eval_logger.info(f"Using ROBUST memory layer (no JSON schema dependency)")
 
@@ -535,9 +556,13 @@ def main():
                         help="Launch this many worker processes and merge outputs")
     parser.add_argument("--sample-ids", type=str, default=None,
                         help="Comma-separated dataset sample ids to evaluate")
+    parser.add_argument("--raw_llm_log", type=str, default=None,
+                        help="Optional file path for full raw LLM prompts/responses.")
     args = parser.parse_args()
     load_dotenv(override=True)
     args.api_base = resolve_api_base(args.api_base)
+
+    raw_llm_log = args.raw_llm_log
 
     if args.ratio <= 0.0 or args.ratio > 1.0:
         raise ValueError("Ratio must be between 0.0 and 1.0")
@@ -548,6 +573,15 @@ def main():
     if args.sample_ids:
         sample_ids = [int(part.strip()) for part in args.sample_ids.split(",") if part.strip()]
 
+    timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
+    worker_suffix = f"_worker{args.worker_id}" if args.num_workers > 1 else ""
+    default_log_filename = f"eval_robust_{args.model}_{args.backend}_ratio{args.ratio}{worker_suffix}_{timestamp}.log"
+    default_log_path = os.path.join(os.path.dirname(__file__), "logs", default_log_filename)
+    os.makedirs(os.path.dirname(default_log_path), exist_ok=True)
+    if raw_llm_log is None:
+        raw_llm_log = default_log_path.replace('.log', '.raw_llm.log')
+    setup_logger(default_log_path, raw_llm_log)
+
     if args.batch is not None:
         if args.batch == 1:
             args.num_workers = 1
@@ -556,6 +590,9 @@ def main():
             run_batch_workers(args, dataset_path, output_path)
             return
 
+    logger = logging.getLogger('locomo_eval_robust')
+    logger.info('Raw LLM log file: %s', raw_llm_log)
+
     evaluate_dataset(
         dataset_path, args.model, output_path, args.ratio,
         args.backend, args.temperature_c5, args.retrieve_k,
@@ -563,6 +600,7 @@ def main():
         args.api_key, args.api_base,
         args.start_sample, args.end_sample,
         args.num_workers, args.worker_id, sample_ids,
+        raw_llm_log,
     )
 
 

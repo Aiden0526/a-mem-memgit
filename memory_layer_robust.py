@@ -41,6 +41,7 @@ from llm_text_parsers import (
 )
 
 logger = logging.getLogger("amem_robust")
+raw_logger = logging.getLogger("amem_robust_raw")
 
 
 def normalize_openai_compatible_base_url(api_base: Optional[str]) -> Optional[str]:
@@ -66,6 +67,13 @@ def normalize_openai_compatible_base_url(api_base: Optional[str]) -> Optional[st
         normalized = normalized[: -len(suffix)]
 
     return normalized
+
+
+def is_salesforce_gateway_base_url(api_base: Optional[str]) -> bool:
+    if not api_base:
+        return False
+    normalized = normalize_openai_compatible_base_url(api_base) or ""
+    return "gateway.salesforceresearch.ai/openai/process/" in normalized
 
 # ---------------------------------------------------------------------------
 # Retry decorator
@@ -131,25 +139,38 @@ class RobustOpenAIController(RobustBaseLLMController):
         except ImportError:
             raise ImportError("OpenAI package not found. Install it with: pip install openai")
         self.model = model
+        normalized_api_base = normalize_openai_compatible_base_url(
+            api_base or os.getenv("OPENAI_BASE_URL") or os.getenv("PPAPI_BASE_URL")
+        )
+        uses_salesforce_gateway = is_salesforce_gateway_base_url(normalized_api_base)
+
         if api_key is None:
             api_key = (
                 os.getenv('OPENAI_API_KEY')
                 or os.getenv('PPAPI_API_KEY')
                 or os.getenv('OPENAI_KEY')
+                or os.getenv('X_API_KEY')
             )
         if api_key is None:
             raise ValueError(
-                "OpenAI-compatible API key not found. Set OPENAI_API_KEY or PPAPI_API_KEY."
+                "OpenAI-compatible API key not found. Set OPENAI_API_KEY, PPAPI_API_KEY, or X_API_KEY."
             )
-        client_kwargs = {"api_key": api_key}
-        normalized_api_base = normalize_openai_compatible_base_url(
-            api_base or os.getenv("OPENAI_BASE_URL") or os.getenv("PPAPI_BASE_URL")
-        )
+
+        client_kwargs = {}
+        if uses_salesforce_gateway:
+            client_kwargs["api_key"] = "dummy"
+            client_kwargs["default_headers"] = {"X-Api-Key": api_key}
+        else:
+            client_kwargs["api_key"] = api_key
+
         if normalized_api_base:
             client_kwargs["base_url"] = normalized_api_base
         self.client = OpenAI(**client_kwargs)
         self.base_url = normalized_api_base or "https://api.openai.com/v1"
-        logger.info("RobustOpenAIController initialized model=%s base_url=%s", self.model, self.base_url)
+        logger.info(
+            "RobustOpenAIController initialized model=%s base_url=%s auth_mode=%s",
+            self.model, self.base_url, "x-api-key" if uses_salesforce_gateway else "bearer",
+        )
 
     @retry_llm_call(max_retries=2)
     def get_completion(self, prompt: str, temperature: float = 0.7, max_tokens: int = 1000) -> str:
@@ -160,6 +181,11 @@ class RobustOpenAIController(RobustBaseLLMController):
             "LLM request start model=%s digest=%s prompt_chars=%d temperature=%.2f max_tokens=%d preview=%r",
             self.model, prompt_digest, len(prompt), temperature, max_tokens, prompt_preview,
         )
+        if raw_logger.handlers:
+            raw_logger.info(
+                "REQUEST model=%s digest=%s temperature=%.2f max_tokens=%d\nPROMPT:\n%s",
+                self.model, prompt_digest, temperature, max_tokens, prompt,
+            )
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
@@ -176,6 +202,11 @@ class RobustOpenAIController(RobustBaseLLMController):
             "LLM request done model=%s digest=%s elapsed=%.2fs response_chars=%d",
             self.model, prompt_digest, elapsed, len(content or ""),
         )
+        if raw_logger.handlers:
+            raw_logger.info(
+                "RESPONSE model=%s digest=%s elapsed=%.2fs\n%s",
+                self.model, prompt_digest, elapsed, content or "",
+            )
         return content
 
 

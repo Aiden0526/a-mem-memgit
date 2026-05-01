@@ -16,8 +16,8 @@ fi
 # =========================
 # Change these values directly if you want a single file that is ready to run
 # after download. Environment variables still override them.
-CONFIG_API_KEY="sk-tBM2jk6fMYPNFKsBTcIQV61m2eOxeev1YxP360IpXUhhqSJu"
-CONFIG_API_BASE="https://app.ppapi.ai/v1/chat/completions"
+CONFIG_API_KEY=
+CONFIG_API_BASE=
 CONFIG_BACKEND="openai"
 CONFIG_DATASET="data/locomo10.json"
 CONFIG_RATIO="0.1"
@@ -28,9 +28,10 @@ CONFIG_RETRIEVE_K="10"
 CONFIG_PATCH_TOP_K="2"
 CONFIG_PATCH_USAGE="always"
 CONFIG_TEMPERATURE_C5="0.5"
-CONFIG_RUN_TARGET="patch" # robust, patch, or both
+CONFIG_RAW_LLM_LOG="logs/gpt55_robust_raw.log"
+CONFIG_RUN_TARGET="robust" # robust, patch, or both
 CONFIG_MODELS=(
-  "gpt-5.4"
+  "gpt-5.5-2026-04-23"
 )
 
 usage() {
@@ -57,6 +58,7 @@ Supported overrides:
   PATCH_TOP_K      Patch retrieval top-k
   PATCH_USAGE      Patch mode
   TEMPERATURE_C5   Category-5 temperature override
+  RAW_LLM_LOG      Optional raw prompt/response log file for robust runs
 
 Examples:
   bash scripts/run_locomo_baseline_patch_3models.sh both
@@ -89,6 +91,7 @@ RETRIEVE_K="${RETRIEVE_K:-$CONFIG_RETRIEVE_K}"
 PATCH_TOP_K="${PATCH_TOP_K:-$CONFIG_PATCH_TOP_K}"
 PATCH_USAGE="${PATCH_USAGE:-$CONFIG_PATCH_USAGE}"
 TEMPERATURE_C5="${TEMPERATURE_C5:-$CONFIG_TEMPERATURE_C5}"
+RAW_LLM_LOG="${RAW_LLM_LOG:-$CONFIG_RAW_LLM_LOG}"
 
 MODELS=("${CONFIG_MODELS[@]}")
 if [[ -n "${MODEL_LIST:-}" ]]; then
@@ -150,6 +153,9 @@ print_resolved_config() {
   echo "Dataset: $DATASET"
   echo "Ratio: $RATIO | start_sample: $START_SAMPLE | end_sample: ${END_SAMPLE:-NONE} | batch: $BATCH"
   echo "retrieve_k: $RETRIEVE_K | patch_top_k: $PATCH_TOP_K | patch_usage: $PATCH_USAGE | temperature_c5: $TEMPERATURE_C5"
+  if [[ -n "$RAW_LLM_LOG" ]]; then
+    echo "raw_llm_log: $RAW_LLM_LOG"
+  fi
   echo "Models: ${MODELS[*]}"
 }
 
@@ -171,6 +177,9 @@ for model in "${MODELS[@]}"; do
       --retrieve_k "$RETRIEVE_K"
       --output "$robust_output"
     )
+    if [[ -n "$RAW_LLM_LOG" ]]; then
+      robust_cmd+=(--raw_llm_log "$RAW_LLM_LOG")
+    fi
     echo "Running robust baseline -> $robust_output"
     "${robust_cmd[@]}"
   fi
