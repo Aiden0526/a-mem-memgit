@@ -28,11 +28,11 @@ from sentence_transformers.util import pytorch_cos_sim
 import statistics
 from collections import defaultdict
 import pickle
-import random
 import subprocess
 import sys
 from tqdm import tqdm
-from utils import calculate_metrics, aggregate_metrics
+from utils import calculate_locomo_official_metrics, aggregate_metrics
+from locomo_eval_utils import build_locomo_answer_prompt, locomo_answer_temperature, get_locomo_prompt_answer, get_locomo_reference_answer
 from datetime import datetime
 
 # Download required NLTK data
@@ -131,34 +131,8 @@ Keywords:"""
 
         assert category in [1, 2, 3, 4, 5]
 
-        if category == 5:
-            answer_tmp = list()
-            if random.random() < 0.5:
-                answer_tmp.append('Not mentioned in the conversation')
-                answer_tmp.append(answer)
-            else:
-                answer_tmp.append(answer)
-                answer_tmp.append('Not mentioned in the conversation')
-            user_prompt = f"""Based on the context: {context}, answer the following question. {question}
-
-Select the correct answer: {answer_tmp[0]} or {answer_tmp[1]}  Short answer:"""
-            temperature = self.temperature_c5
-        elif category == 2:
-            user_prompt = f"""Based on the context: {context}, answer the following question. Use DATE of CONVERSATION to answer with an approximate date.
-Please generate the shortest possible answer, using words from the conversation where possible, and avoid using any subjects.
-
-Question: {question} Short answer:"""
-            temperature = 0.7
-        elif category == 3:
-            user_prompt = f"""Based on the context: {context}, write an answer in the form of a short phrase for the following question. Answer with exact words from the context whenever possible.
-
-Question: {question} Short answer:"""
-            temperature = 0.7
-        else:
-            user_prompt = f"""Based on the context: {context}, write an answer in the form of a short phrase for the following question. Answer with exact words from the context whenever possible.
-
-Question: {question} Short answer:"""
-            temperature = 0.7
+        user_prompt = build_locomo_answer_prompt(question, category, answer, context)
+        temperature = locomo_answer_temperature(category, self.temperature_c5)
 
         try:
             response = self.memory_system.llm_controller.llm.get_completion(
@@ -334,8 +308,10 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                 qa_progress.set_postfix_str(f"global={total_questions}/{total_qas_in_run} cat={qa.category}")
                 category_counts[qa.category] += 1
 
+                prompt_answer = get_locomo_prompt_answer(qa.category, qa.answer, qa.adversarial_answer)
+                reference_answer = get_locomo_reference_answer(qa.category, qa.answer)
                 prediction, user_prompt, raw_context = agent.answer_question(
-                    qa.question, qa.category, qa.final_answer
+                    qa.question, qa.category, prompt_answer
                 )
 
                 # Parse the prediction (handles both JSON and plain text)
@@ -343,16 +319,13 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
 
                 eval_logger.info(f"Question {total_questions}: {qa.question}")
                 eval_logger.info(f"Prediction: {prediction}")
-                eval_logger.info(f"Reference: {qa.final_answer}")
+                eval_logger.info(f"Reference: {reference_answer}")
+                eval_logger.info(f"Adversarial Answer: {qa.adversarial_answer}")
                 eval_logger.info(f"User Prompt: {user_prompt}")
                 eval_logger.info(f"Category: {qa.category}")
                 eval_logger.info(f"Raw Context: {raw_context}")
 
-                metrics = calculate_metrics(prediction, qa.final_answer) if qa.final_answer else {
-                    "exact_match": 0, "f1": 0.0, "rouge1_f": 0.0, "rouge2_f": 0.0,
-                    "rougeL_f": 0.0, "bleu1": 0.0, "bleu2": 0.0, "bleu3": 0.0,
-                    "bleu4": 0.0, "bert_f1": 0.0, "meteor": 0.0, "sbert_similarity": 0.0
-                }
+                metrics = calculate_locomo_official_metrics(prediction, reference_answer, qa.category)
 
                 all_metrics.append(metrics)
                 all_categories.append(qa.category)
@@ -361,11 +334,13 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                     "sample_id": sample_idx,
                     "question": qa.question,
                     "prediction": prediction,
-                    "reference": qa.final_answer,
+                    "reference": reference_answer,
+                    "adversarial_answer": qa.adversarial_answer,
                     "category": qa.category,
                     "user_prompt": user_prompt,
                     "raw_context": raw_context,
                     "metrics": metrics,
+                    "evaluation_protocol": "official_locomo",
                 }
                 results.append(result)
 

@@ -3,7 +3,7 @@ import string
 import numpy as np
 from typing import List, Dict, Union
 import statistics
-from collections import defaultdict
+from collections import Counter, defaultdict
 from rouge_score import rouge_scorer
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from bert_score import score as bert_score
@@ -33,10 +33,13 @@ except Exception as e:
     sentence_model = None
 
 def simple_tokenize(text):
-    """Simple tokenization function."""
-    # Convert to string if not already
+    """Normalize text for evaluation metrics with punctuation-robust tokenization."""
     text = str(text)
-    return text.lower().replace('.', ' ').replace(',', ' ').replace('!', ' ').replace('?', ' ').split()
+    return [
+        token.lower()
+        for token in wordpunct_tokenize(text)
+        if any(char.isalnum() for char in token)
+    ]
 
 def calculate_rouge_scores(prediction: str, reference: str) -> Dict[str, float]:
     """Calculate ROUGE scores for prediction against reference."""
@@ -106,6 +109,58 @@ def calculate_sentence_similarity(prediction: str, reference: str) -> float:
     except Exception as e:
         print(f"Error calculating sentence similarity: {e}")
         return 0.0
+
+def _official_normalize_answer(text: str) -> str:
+    text = str(text).replace(',', '')
+    lowered = text.lower()
+    stripped = ''.join(ch for ch in lowered if ch not in set(string.punctuation))
+    words = [w for w in stripped.split() if w not in {'a', 'an', 'the', 'and'}]
+    return ' '.join(words)
+
+
+def _official_f1_score_single(prediction: str, ground_truth: str) -> float:
+    prediction_tokens = _official_normalize_answer(prediction).split()
+    ground_truth_tokens = _official_normalize_answer(ground_truth).split()
+    common = Counter(prediction_tokens) & Counter(ground_truth_tokens)
+    num_same = sum(common.values())
+    if num_same == 0:
+        return 0.0
+    precision = num_same / len(prediction_tokens)
+    recall = num_same / len(ground_truth_tokens)
+    return 2 * precision * recall / (precision + recall)
+
+
+def _official_f1_score_multi(prediction: str, ground_truth: str) -> float:
+    predictions = [p.strip() for p in str(prediction).split(',')]
+    ground_truths = [g.strip() for g in str(ground_truth).split(',')]
+    if not ground_truths:
+        return 0.0
+    values = []
+    for gt in ground_truths:
+        values.append(max(_official_f1_score_single(pred, gt) for pred in predictions))
+    return sum(values) / len(values)
+
+
+def calculate_locomo_official_score(prediction: str, reference: str | None, category: int) -> float:
+    prediction = str(prediction or '').strip()
+    reference = str(reference or '').strip()
+    if category in [2, 3, 4]:
+        return _official_f1_score_single(prediction, reference)
+    if category == 1:
+        return _official_f1_score_multi(prediction, reference)
+    if category == 5:
+        lowered = prediction.lower()
+        return 1.0 if ('no information available' in lowered or 'not mentioned' in lowered) else 0.0
+    raise ValueError(f'Unexpected LoCoMo category: {category}')
+
+
+def calculate_locomo_official_metrics(prediction: str, reference: str | None, category: int) -> Dict[str, float]:
+    score = calculate_locomo_official_score(prediction, reference, category)
+    return {
+        'f1': score,
+        'official_locomo_score': score,
+    }
+
 
 def calculate_metrics(prediction: str, reference: str) -> Dict[str, float]:
     """Calculate comprehensive evaluation metrics for a prediction."""

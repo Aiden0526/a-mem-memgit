@@ -33,6 +33,11 @@ from patch_prompts import (
     PATCH_SUMMARIZATION_PREF_PROMPT,
 )
 from patch_store import PatchStore
+from locomo_eval_utils import (
+    build_locomo_answer_instruction,
+    build_locomo_answer_prompt,
+    locomo_answer_temperature,
+)
 
 logger = logging.getLogger("amem_patch_layer")
 
@@ -999,34 +1004,11 @@ class PatchAugmentedMemorySystem:
 
     @staticmethod
     def _build_answer_instruction(question: str, category: int, answer: str) -> str:
-        if category == 5:
-            return (
-                f"Answer the following question: {question}. "
-                f"Select the correct answer: {answer} or Not mentioned in the conversation. "
-                "Return only the short answer."
-            )
-        if category == 2:
-            return (
-                "Use DATE of CONVERSATION to answer with an approximate date. "
-                "Generate the shortest possible answer, using words from the conversation where possible, "
-                "and avoid using any subjects."
-            )
-        return "Write an answer in the form of a short phrase. Use exact words from the context whenever possible."
+        return build_locomo_answer_instruction(question, category, answer)
 
     @staticmethod
     def _build_answer_prompt(question: str, category: int, answer: str, context: str) -> str:
-        if category == 5:
-            return f"""Based on the context: {context}, answer the following question. {question}
-
-Select the correct answer: {answer} or Not mentioned in the conversation  Short answer:"""
-        if category == 2:
-            return f"""Based on the context: {context}, answer the following question. Use DATE of CONVERSATION to answer with an approximate date.
-Please generate the shortest possible answer, using words from the conversation where possible, and avoid using any subjects.
-
-Question: {question} Short answer:"""
-        return f"""Based on the context: {context}, write an answer in the form of a short phrase for the following question. Answer with exact words from the context whenever possible.
-
-Question: {question} Short answer:"""
+        return build_locomo_answer_prompt(question, category, answer, context)
 
     def _filter_selected_patches(self, selected_patch_ids: List[str], retrieved_patches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         patch_map = {patch.get("patch_id"): patch for patch in retrieved_patches}
@@ -1037,7 +1019,7 @@ Question: {question} Short answer:"""
                 selected.append(patch)
         return selected
 
-    def answer_with_patch_history_gated(self, question: str, category: int, answer: str) -> tuple:
+    def answer_with_patch_history_gated(self, question: str, category: int, answer: str, temperature_c5: float = 0.5) -> tuple:
         query = self.generate_query_llm(question)
         current_context = self.retrieve_current_context(query, self.config.retrieve_k_current)
         patches = self.retrieve_relevant_patches(query, self.config.patch_top_k)
@@ -1056,7 +1038,8 @@ Question: {question} Short answer:"""
             current_context=current_context,
             patch_summaries=patch_summaries,
         )
-        gating_response = self.base_system.llm_controller.llm.get_completion(gating_prompt, temperature=0.7)
+        answer_temperature = locomo_answer_temperature(category, temperature_c5)
+        gating_response = self.base_system.llm_controller.llm.get_completion(gating_prompt, temperature=answer_temperature)
         gating_result = self._parse_patch_gating_response(gating_response)
 
         if not gating_result["need_patch_detail"]:
@@ -1095,7 +1078,7 @@ Question: {question} Short answer:"""
             patch_details="\n\n".join(self.format_patch_for_context(patch, detail_selected_items.get(patch.get('patch_id'))) for patch in selected_patches),
             draft_answer=gating_result["draft_answer"],
         )
-        detail_response = self.base_system.llm_controller.llm.get_completion(detail_prompt, temperature=0.7)
+        detail_response = self.base_system.llm_controller.llm.get_completion(detail_prompt, temperature=answer_temperature)
         detail_result = self._parse_patch_revision_response(detail_response)
         metadata = {
             "patch_usage": "gated",
@@ -1110,14 +1093,17 @@ Question: {question} Short answer:"""
         }
         return detail_result["final_answer"], detail_prompt, detail_context, metadata
 
-    def answer_with_patch_history(self, question: str, category: int, answer: str) -> tuple:
+    def answer_with_patch_history(self, question: str, category: int, answer: str, temperature_c5: float = 0.5) -> tuple:
         query = self.generate_query_llm(question)
         current_context = self.retrieve_current_context(query, self.config.retrieve_k_current)
         patches = self.retrieve_relevant_patches(query, self.config.patch_top_k)
         selected_patch_items = self._select_patch_items(question, query, category, patches)
         context = self.build_augmented_context(current_context, patches, selected_patch_items)
         prompt = self._build_answer_prompt(question, category, answer, context)
-        response = self.base_system.llm_controller.llm.get_completion(prompt, temperature=0.7)
+        response = self.base_system.llm_controller.llm.get_completion(
+            prompt,
+            temperature=locomo_answer_temperature(category, temperature_c5),
+        )
         metadata = {
             "patch_usage": "always",
             "need_patch_detail": bool(patches),

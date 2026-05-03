@@ -16,7 +16,8 @@ from datetime import datetime
 from pathlib import Path
 from tqdm.auto import tqdm
 from load_dataset import load_locomo_dataset
-from utils import calculate_metrics, aggregate_metrics
+from locomo_eval_utils import get_locomo_prompt_answer, get_locomo_reference_answer
+from utils import calculate_locomo_official_metrics, aggregate_metrics
 
 logger = logging.getLogger("amem_patch")
 
@@ -111,8 +112,18 @@ Keywords:"""
 
     def answer_question(self, question: str, category: int, answer: str):
         if self.memory_system.config.patch_usage == "gated":
-            return self.memory_system.answer_with_patch_history_gated(question, category, answer)
-        return self.memory_system.answer_with_patch_history(question, category, answer)
+            return self.memory_system.answer_with_patch_history_gated(
+                question,
+                category,
+                answer,
+                temperature_c5=self.temperature_c5,
+            )
+        return self.memory_system.answer_with_patch_history(
+            question,
+            category,
+            answer,
+            temperature_c5=self.temperature_c5,
+        )
 
 
 def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
@@ -243,15 +254,13 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
                 qa.question,
             )
             category_counts[qa.category] += 1
+            prompt_answer = get_locomo_prompt_answer(qa.category, qa.answer, qa.adversarial_answer)
+            reference_answer = get_locomo_reference_answer(qa.category, qa.answer)
             prediction, user_prompt, raw_context, answer_metadata = agent.answer_question(
-                qa.question, qa.category, qa.final_answer
+                qa.question, qa.category, prompt_answer
             )
             prediction = parse_plain_text_answer(prediction)
-            metrics = calculate_metrics(prediction, qa.final_answer) if qa.final_answer else {
-                "exact_match": 0, "f1": 0.0, "rouge1_f": 0.0, "rouge2_f": 0.0,
-                "rougeL_f": 0.0, "bleu1": 0.0, "bleu2": 0.0, "bleu3": 0.0,
-                "bleu4": 0.0, "bert_f1": 0.0, "meteor": 0.0, "sbert_similarity": 0.0
-            }
+            metrics = calculate_locomo_official_metrics(prediction, reference_answer, qa.category)
             all_metrics.append(metrics)
             all_categories.append(qa.category)
             qa_results.append({
@@ -261,11 +270,13 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
                 "category": qa.category,
                 "question": qa.question,
                 "prediction": prediction,
-                "reference": qa.final_answer,
+                "reference": reference_answer,
+                "adversarial_answer": qa.adversarial_answer,
                 "user_prompt": user_prompt,
                 "raw_context": raw_context,
                 "metrics": metrics,
                 "answer_metadata": answer_metadata,
+                "evaluation_protocol": "official_locomo",
             })
             logger.info("sample=%s category=%s question=%s prediction=%s", sample_idx, qa.category, qa.question, prediction)
             logger.debug("prompt=%s", user_prompt)
@@ -429,7 +440,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="data/locomo10.json")
     parser.add_argument("--model", type=str, default="gpt-4o-mini")
     parser.add_argument("--backend", type=str, default="openai", choices=["openai", "openrouter", "ollama", "sglang", "vllm"])
-    parser.add_argument("--ratio", type=float, default=0.1)
+    parser.add_argument("--ratio", type=float, default=1.0)
     parser.add_argument("--retrieve_k", type=int, default=10)
     parser.add_argument("--patch_top_k", type=int, default=2)
     parser.add_argument("--patch_usage", type=str, default="always", choices=["always", "gated"])
