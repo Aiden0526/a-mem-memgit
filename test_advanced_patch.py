@@ -53,6 +53,18 @@ def resolve_api_base(api_base: str | None) -> str | None:
     )
 
 
+def resolve_local_backend_endpoint(
+    backend: str,
+    sglang_host: str,
+    sglang_port: int,
+    vllm_host: str | None,
+    vllm_port: int | None,
+) -> tuple[str, int]:
+    if backend == "vllm":
+        return vllm_host or sglang_host, vllm_port or sglang_port
+    return sglang_host, sglang_port
+
+
 class PatchAdvancedMemAgent:
     def __init__(self, model, backend, retrieve_k, temperature_c5,
                  sglang_host="http://localhost", sglang_port=30000,
@@ -130,6 +142,7 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
                      backend: str = "sglang", temperature_c5: float = 0.5,
                      retrieve_k: int = 10, patch_top_k: int = 5,
                      sglang_host: str = "http://localhost", sglang_port: int = 30000,
+                     vllm_host: str | None = None, vllm_port: int | None = None,
                      max_samples: int | None = None,
                      start_sample: int = 0,
                      end_sample: int | None = None,
@@ -170,9 +183,17 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
         samples = [sample for sample_idx, sample in enumerate(samples)
                    if sample_idx % num_workers == worker_id]
 
+    local_host, local_port = resolve_local_backend_endpoint(
+        backend,
+        sglang_host,
+        sglang_port,
+        vllm_host,
+        vllm_port,
+    )
+
     agent = PatchAdvancedMemAgent(
         model, backend, retrieve_k, temperature_c5,
-        sglang_host, sglang_port, patch_top_k, patch_usage, api_key, api_base,
+        local_host, local_port, patch_top_k, patch_usage, api_key, api_base,
         min_patch_similarity=min_patch_similarity,
         patch_node_rerank=patch_node_rerank,
         patch_node_top_k=patch_node_top_k,
@@ -372,6 +393,8 @@ def run_batch_workers(args) -> dict:
         "--patch_hybrid_alpha", str(args.patch_hybrid_alpha),
         "--sglang_host", args.sglang_host,
         "--sglang_port", str(args.sglang_port),
+        "--vllm_host", args.vllm_host,
+        "--vllm_port", str(args.vllm_port),
         "--start_sample", str(args.start_sample),
         "--num_workers", str(args.batch),
     ]
@@ -455,6 +478,10 @@ if __name__ == "__main__":
     parser.add_argument("--temperature_c5", type=float, default=0.5)
     parser.add_argument("--sglang_host", type=str, default="http://localhost")
     parser.add_argument("--sglang_port", type=int, default=30000)
+    parser.add_argument("--vllm_host", type=str, default="http://localhost",
+                        help="vLLM server host when --backend vllm")
+    parser.add_argument("--vllm_port", type=int, default=8000,
+                        help="vLLM server port when --backend vllm")
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--start_sample", type=int, default=0)
     parser.add_argument("--end_sample", type=int, default=None)
@@ -499,6 +526,8 @@ if __name__ == "__main__":
         patch_top_k=args.patch_top_k,
         sglang_host=args.sglang_host,
         sglang_port=args.sglang_port,
+        vllm_host=args.vllm_host,
+        vllm_port=args.vllm_port,
         max_samples=args.max_samples,
         start_sample=args.start_sample,
         end_sample=args.end_sample,

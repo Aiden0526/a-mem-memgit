@@ -186,6 +186,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                      ratio: float = 1.0, backend: str = "sglang",
                      temperature_c5: float = 0.5, retrieve_k: int = 10,
                      sglang_host: str = "http://localhost", sglang_port: int = 30000,
+                     vllm_host: Optional[str] = None, vllm_port: Optional[int] = None,
                      api_key: Optional[str] = None, api_base: Optional[str] = None,
                      start_sample: int = 0, end_sample: Optional[int] = None,
                      num_workers: int = 1, worker_id: int = 0,
@@ -250,12 +251,15 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
         for _, sample in samples
     )
 
+    local_host = vllm_host or sglang_host if backend == "vllm" else sglang_host
+    local_port = vllm_port or sglang_port if backend == "vllm" else sglang_port
+
     sample_progress = tqdm(samples, desc="Samples", unit="sample")
     for shard_idx, (sample_idx, sample) in enumerate(sample_progress):
         sample_progress.set_postfix_str(f"sample_id={sample_idx}")
         agent = RobustAdvancedMemAgent(
             model, backend, retrieve_k, temperature_c5,
-            sglang_host, sglang_port, api_key, api_base,
+            local_host, local_port, api_key, api_base,
         )
 
         memory_cache_file = os.path.join(memories_dir, f"memory_cache_sample_{sample_idx}.pkl")
@@ -443,6 +447,8 @@ def run_batch_workers(args, dataset_path: str, output_path: Optional[str]) -> Di
         "--retrieve_k", str(args.retrieve_k),
         "--sglang_host", args.sglang_host,
         "--sglang_port", str(args.sglang_port),
+        "--vllm_host", args.vllm_host,
+        "--vllm_port", str(args.vllm_port),
         "--start_sample", str(args.start_sample),
         "--num_workers", str(args.batch),
     ]
@@ -515,6 +521,10 @@ def main():
                         help="SGLang server host (for sglang backend)")
     parser.add_argument("--sglang_port", type=int, default=30000,
                         help="SGLang server port (for sglang backend)")
+    parser.add_argument("--vllm_host", type=str, default="http://localhost",
+                        help="vLLM server host (for vllm backend)")
+    parser.add_argument("--vllm_port", type=int, default=8000,
+                        help="vLLM server port (for vllm backend)")
     parser.add_argument("--api_key", type=str, default=None,
                         help="OpenAI-compatible API key. Defaults to environment variables.")
     parser.add_argument("--api_base", type=str, default=None,
@@ -572,6 +582,7 @@ def main():
         dataset_path, args.model, output_path, args.ratio,
         args.backend, args.temperature_c5, args.retrieve_k,
         args.sglang_host, args.sglang_port,
+        args.vllm_host, args.vllm_port,
         args.api_key, args.api_base,
         args.start_sample, args.end_sample,
         args.num_workers, args.worker_id, sample_ids,

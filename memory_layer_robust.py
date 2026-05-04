@@ -266,12 +266,13 @@ class RobustVLLMController(RobustBaseLLMController):
     """Controller for vLLM's OpenAI-compatible API server."""
 
     def __init__(self, model: str = "llama2",
+                 api_base: Optional[str] = None,
                  vllm_host: str = "http://localhost",
                  vllm_port: int = 30000):
         import requests as _requests
         self._requests = _requests
         self.model = model
-        self.base_url = f"{vllm_host}:{vllm_port}"
+        self.base_url = normalize_openai_compatible_base_url(api_base) or f"{vllm_host}:{vllm_port}/v1"
 
     @retry_llm_call(max_retries=2)
     def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
@@ -285,7 +286,7 @@ class RobustVLLMController(RobustBaseLLMController):
             "max_tokens": 1000,
         }
         response = self._requests.post(
-            f"{self.base_url}/v1/chat/completions",
+            f"{self.base_url}/chat/completions",
             headers={"Content-Type": "application/json"},
             json=payload,
             timeout=120,
@@ -359,7 +360,7 @@ class RobustLLMController:
         elif backend == "sglang":
             self.llm = RobustSGLangController(model, sglang_host, sglang_port)
         elif backend == "vllm":
-            self.llm = RobustVLLMController(model, sglang_host, sglang_port)
+            self.llm = RobustVLLMController(model, api_base, sglang_host, sglang_port)
         else:
             raise ValueError("Backend must be 'openai', 'openrouter', 'ollama', 'sglang', or 'vllm'")
 
