@@ -1086,16 +1086,26 @@ def run_batch_workers(args: argparse.Namespace, benchmark_file: Path, output_pat
     for worker_id in range(args.batch):
         worker_output = _worker_output_path(output_path, worker_id)
         cmd = child_base + ["--worker_id", str(worker_id), "--output", str(worker_output)]
-        processes.append((worker_id, worker_output, subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parent))))
+        worker_stderr = worker_output.with_suffix(worker_output.suffix + ".stderr.log")
+        worker_stderr.parent.mkdir(parents=True, exist_ok=True)
+        stderr_handle = worker_stderr.open("w", encoding="utf-8")
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(Path(__file__).resolve().parent),
+            stdout=None,
+            stderr=stderr_handle,
+        )
+        stderr_handle.close()
+        processes.append((worker_id, worker_output, worker_stderr, process))
         worker_outputs.append(worker_output)
 
     failures = []
-    for worker_id, worker_output, process in processes:
+    for worker_id, worker_output, worker_stderr, process in processes:
         return_code = process.wait()
         if return_code != 0:
             failures.append((worker_id, return_code))
         else:
-            logger.info("worker_id=%s completed output=%s", worker_id, worker_output)
+            logger.info("worker_id=%s completed output=%s stderr_log=%s", worker_id, worker_output, worker_stderr)
 
     if failures:
         failed = ", ".join(f"worker {worker_id} (exit {code})" for worker_id, code in failures)

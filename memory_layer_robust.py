@@ -75,6 +75,14 @@ def is_salesforce_gateway_base_url(api_base: Optional[str]) -> bool:
     normalized = normalize_openai_compatible_base_url(api_base) or ""
     return "gateway.salesforceresearch.ai/openai/process/" in normalized
 
+
+def normalize_litellm_model_name(backend: str, model: str) -> str:
+    """Normalize provider-qualified model names for LiteLLM backends."""
+    normalized = model.strip()
+    if backend == "openrouter" and normalized and not normalized.startswith("openrouter/"):
+        return f"openrouter/{normalized}"
+    return normalized
+
 # ---------------------------------------------------------------------------
 # Retry decorator
 # ---------------------------------------------------------------------------
@@ -351,7 +359,7 @@ class RobustLLMController:
             self.llm = RobustOpenAIController(model, api_key, api_base)
         elif backend == "openrouter":
             self.llm = RobustLiteLLMController(
-                model=model,
+                model=normalize_litellm_model_name("openrouter", model),
                 api_base=api_base or "https://openrouter.ai/api/v1",
                 api_key=api_key or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY") or "EMPTY",
             )
