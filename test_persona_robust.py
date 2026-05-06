@@ -279,6 +279,56 @@ def build_cache_key(chat_history_path: Path, include_system_messages: bool) -> s
     return hashlib.md5(payload.encode("utf-8")).hexdigest()
 
 
+def build_status_path(cache_dir: Path, cache_key: str) -> Path:
+    return cache_dir / f"build_status_{cache_key}.json"
+
+
+def load_build_status(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_persona_build_checkpoint(
+    agent: "PersonaRobustAgent",
+    memory_cache_file: Path,
+    retriever_cache_file: Path,
+    retriever_cache_embeddings_file: Path,
+    status_path: Path,
+    cache_key: str,
+    next_message_index: int,
+    total_messages: int,
+    complete: bool,
+) -> None:
+    agent.save_cached_state(memory_cache_file, retriever_cache_file, retriever_cache_embeddings_file)
+    status_path.write_text(
+        json.dumps(
+            {
+                "cache_key": cache_key,
+                "next_message_index": next_message_index,
+                "total_messages": total_messages,
+                "complete": complete,
+                "updated_at": datetime.utcnow().isoformat() + "Z",
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def load_existing_output_rows(output_path: Path) -> tuple[List[Dict[str, str]], List[str]]:
+    if not output_path.exists():
+        return [], []
+    with output_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        return rows, list(reader.fieldnames or [])
+
+
 class PersonaRobustAgent:
     def __init__(
         self,
@@ -490,16 +540,34 @@ class AgentManager:
 
         agent = self._new_agent()
         memory_cache, retriever_cache, retriever_embeddings = self._cache_paths(chat_history_path)
+        status_path = build_status_path(self.cache_dir, cache_key)
+        build_status = load_build_status(status_path)
 
         if memory_cache.exists():
             self.eval_logger.info("Loading cached A-MEM state for %s", chat_history_path.name)
             agent.load_cached_state(memory_cache, retriever_cache, retriever_embeddings)
+
+        resume_message_index = 0
+        if memory_cache.exists() and (build_status.get("complete") or not build_status):
+            self.eval_logger.info("Loaded complete cached A-MEM state for %s", chat_history_path.name)
         else:
-            self.eval_logger.info("Building A-MEM state for %s", chat_history_path.name)
             messages = load_chat_history_messages(chat_history_path)
-            loaded_messages = 0
+            total_messages = len(messages)
+            if memory_cache.exists():
+                resume_message_index = min(int(build_status.get("next_message_index", 0) or 0), total_messages)
+                self.eval_logger.info(
+                    "Resuming A-MEM build for %s from message %s/%s",
+                    chat_history_path.name,
+                    resume_message_index,
+                    total_messages,
+                )
+            else:
+                self.eval_logger.info("Building A-MEM state for %s", chat_history_path.name)
+
+            loaded_messages = resume_message_index
             for idx, message in enumerate(
-                make_progress(messages, desc=f"Build memory {chat_history_path.stem}", leave=False)
+                make_progress(messages[resume_message_index:], desc=f"Build memory {chat_history_path.stem}", leave=False),
+                start=resume_message_index,
             ):
                 role = str(message.get("role", "")).lower()
                 if not self.include_system_messages and role == "system":
@@ -509,7 +577,28 @@ class AgentManager:
                     continue
                 agent.add_memory(serialize_chat_message(message, idx), time=f"message_{idx:04d}")
                 loaded_messages += 1
-            agent.save_cached_state(memory_cache, retriever_cache, retriever_embeddings)
+                save_persona_build_checkpoint(
+                    agent,
+                    memory_cache,
+                    retriever_cache,
+                    retriever_embeddings,
+                    status_path,
+                    cache_key,
+                    idx + 1,
+                    total_messages,
+                    complete=False,
+                )
+            save_persona_build_checkpoint(
+                agent,
+                memory_cache,
+                retriever_cache,
+                retriever_embeddings,
+                status_path,
+                cache_key,
+                total_messages,
+                total_messages,
+                complete=True,
+            )
             self.eval_logger.info(
                 "Cached %d messages for %s", loaded_messages, chat_history_path.name
             )
@@ -768,16 +857,24 @@ def evaluate_persona_benchmark(
             output_fieldnames.append(column)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    written_rows: List[Dict[str, str]] = []
-    correct = 0
-    processed = 0
-    mcq_processed = 0
+    existing_rows, existing_fieldnames = load_existing_output_rows(output_path)
+    if existing_fieldnames:
+        output_fieldnames = existing_fieldnames
+    resume_row_index = len(existing_rows)
+    if resume_row_index:
+        eval_logger.info("Resuming from %d existing result rows in %s", resume_row_index, output_path)
+    written_rows: List[Dict[str, str]] = list(existing_rows)
+    correct = sum(1 for row in written_rows if row.get(f"is_correct_mcq_{size}") == "True")
+    processed = resume_row_index
+    mcq_processed = sum(1 for row in written_rows if row.get(f"is_correct_mcq_{size}") in ("True", "False"))
 
-    with output_path.open("w", encoding="utf-8", newline="") as f:
+    file_mode = "a" if resume_row_index else "w"
+    with output_path.open(file_mode, encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=output_fieldnames)
-        writer.writeheader()
+        if not resume_row_index:
+            writer.writeheader()
 
-        for idx, row in enumerate(make_progress(rows, desc="Persona robust eval")):
+        for idx, row in enumerate(make_progress(rows[resume_row_index:], desc="Persona robust eval"), start=resume_row_index):
             output_row = row.copy()
             try:
                 chat_history_path = resolve_chat_history_path(row, size=size, persona_root=persona_root)

@@ -17,21 +17,24 @@ fi
 # Change these values directly if you want a single file that is ready to run
 # after download. Environment variables still override them.
 CONFIG_API_KEY=
-CONFIG_API_BASE=
+CONFIG_API_BASE=https://openrouter.ai/api/v1
 CONFIG_BACKEND="openai"
 CONFIG_DATASET="data/locomo10.json"
-CONFIG_RATIO="0.1"
+CONFIG_RATIO="1.0"
 CONFIG_START_SAMPLE="0"
 CONFIG_END_SAMPLE=""
-CONFIG_BATCH="1"
+CONFIG_BATCH="9"
 CONFIG_RETRIEVE_K="10"
 CONFIG_PATCH_TOP_K="2"
 CONFIG_PATCH_USAGE="always"
 CONFIG_TEMPERATURE_C5="0.5"
 CONFIG_RAW_LLM_LOG="logs/gpt55_robust_raw.log"
-CONFIG_RUN_TARGET="robust" # robust, patch, or both
+CONFIG_RUN_TARGET="patch" # robust, patch, or both
+CONFIG_RESUME="1"
+CONFIG_PATCH_CACHE_ROOT_BASE=""
 CONFIG_MODELS=(
-  "gpt-5.5-2026-04-23"
+  # "qwen/qwen3.6-27b"
+  "moonshotai/kimi-k2.6"
 )
 
 usage() {
@@ -58,6 +61,8 @@ Supported overrides:
   PATCH_TOP_K      Patch retrieval top-k
   PATCH_USAGE      Patch mode
   TEMPERATURE_C5   Category-5 temperature override
+  RESUME           1 to automatically resume from existing outputs/caches
+  PATCH_CACHE_ROOT_BASE Optional base directory for patch caches; per-model subdirs are derived automatically
   RAW_LLM_LOG      Optional raw prompt/response log file for robust runs
 
 Examples:
@@ -92,6 +97,8 @@ PATCH_TOP_K="${PATCH_TOP_K:-$CONFIG_PATCH_TOP_K}"
 PATCH_USAGE="${PATCH_USAGE:-$CONFIG_PATCH_USAGE}"
 TEMPERATURE_C5="${TEMPERATURE_C5:-$CONFIG_TEMPERATURE_C5}"
 RAW_LLM_LOG="${RAW_LLM_LOG:-$CONFIG_RAW_LLM_LOG}"
+RESUME="${RESUME:-$CONFIG_RESUME}"
+PATCH_CACHE_ROOT_BASE="${PATCH_CACHE_ROOT_BASE:-$CONFIG_PATCH_CACHE_ROOT_BASE}"
 
 MODELS=("${CONFIG_MODELS[@]}")
 if [[ -n "${MODEL_LIST:-}" ]]; then
@@ -114,6 +121,26 @@ if [[ "${#MODELS[@]}" -eq 1 && -z "${MODELS[0]}" ]]; then
 fi
 
 mkdir -p robust_results patch_results logs
+
+ensure_resume_ready() {
+  local output_path="$1"
+  local label="$2"
+
+  if [[ "$RESUME" == "1" || "$RESUME" == "true" || "$RESUME" == "TRUE" ]]; then
+    if [[ -f "$output_path" ]]; then
+      echo "Resume enabled: reusing existing $label output $output_path"
+    else
+      echo "Resume enabled: starting fresh $label output $output_path"
+    fi
+    return 0
+  fi
+
+  if [[ -f "$output_path" ]]; then
+    echo "$label output already exists and RESUME=0: $output_path" >&2
+    echo "Either set RESUME=1 to continue, or change the model / output target." >&2
+    exit 1
+  fi
+}
 
 sanitize() {
   local value="$1"
@@ -156,15 +183,21 @@ print_resolved_config() {
   if [[ -n "$RAW_LLM_LOG" ]]; then
     echo "raw_llm_log: $RAW_LLM_LOG"
   fi
+  echo "resume: $RESUME | patch_cache_root_base: ${PATCH_CACHE_ROOT_BASE:-AUTO}"
   echo "Models: ${MODELS[*]}"
 }
 
 print_resolved_config
 
 for model in "${MODELS[@]}"; do
+  patch_cache_root=""
   safe_model="$(sanitize "$model")"
   common_args=()
   build_common_args "$model" common_args
+  if [[ -n "$PATCH_CACHE_ROOT_BASE" ]]; then
+    mkdir -p "$PATCH_CACHE_ROOT_BASE"
+    patch_cache_root="$PATCH_CACHE_ROOT_BASE/locomo_patch_${safe_model}"
+  fi
 
   echo "============================================================"
   echo "Model: $model"
@@ -180,6 +213,7 @@ for model in "${MODELS[@]}"; do
     if [[ -n "$RAW_LLM_LOG" ]]; then
       robust_cmd+=(--raw_llm_log "$RAW_LLM_LOG")
     fi
+    ensure_resume_ready "$robust_output" "LoCoMo robust"
     echo "Running robust baseline -> $robust_output"
     "${robust_cmd[@]}"
   fi
@@ -194,6 +228,10 @@ for model in "${MODELS[@]}"; do
       --patch_usage "$PATCH_USAGE"
       --output "$patch_output"
     )
+    ensure_resume_ready "$patch_output" "LoCoMo patch"
+    if [[ -n "$patch_cache_root" ]]; then
+      patch_cmd+=(--cache_root "$patch_cache_root")
+    fi
     echo "Running patch variant -> $patch_output"
     "${patch_cmd[@]}"
   fi

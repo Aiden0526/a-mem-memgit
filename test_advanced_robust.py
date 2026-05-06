@@ -17,7 +17,7 @@ import os
 import json
 import argparse
 import logging
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional
 from pathlib import Path
 from dotenv import load_dotenv
 import numpy as np
@@ -139,8 +139,10 @@ Keywords:"""
                 user_prompt, temperature=temperature,
             )
         except Exception as e:
-            logger.warning("answer_question failed: %s — returning empty", e)
-            response = ""
+            logger.error("answer_question failed: %s", e)
+            raise
+        if response is None:
+            raise RuntimeError("answer_question received None response from LLM backend")
         return response, user_prompt, raw_context
 
 
@@ -180,6 +182,112 @@ def setup_logger(log_file: Optional[str] = None, raw_llm_log_file: Optional[str]
         raw_logger.addHandler(raw_file_handler)
 
     return eval_logger
+
+
+def atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp_path, path)
+
+
+def build_locomo_result_key(sample_id: int, qa_index: int, category: int, question: str) -> str:
+    return json.dumps([int(sample_id), int(qa_index), int(category), question], ensure_ascii=False)
+
+
+def flatten_sample_turns(sample) -> List[tuple[str, Any]]:
+    turn_entries = []
+    for _, turns in sample.conversation.sessions.items():
+        for turn in turns.turns:
+            turn_entries.append((turns.date_time, turn))
+    return turn_entries
+
+
+def robust_build_status_path(memories_dir: str, sample_idx: int) -> str:
+    return os.path.join(memories_dir, f"build_status_sample_{sample_idx}.json")
+
+
+def load_json_file(path: str) -> Dict[str, Any]:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_robust_build_checkpoint(
+    agent: RobustAdvancedMemAgent,
+    memory_cache_file: str,
+    retriever_cache_file: str,
+    retriever_cache_embeddings_file: str,
+    status_path: str,
+    sample_idx: int,
+    next_turn_index: int,
+    total_turns: int,
+    complete: bool,
+) -> None:
+    with open(memory_cache_file, 'wb') as f:
+        pickle.dump(agent.memory_system.memories, f)
+    agent.memory_system.retriever.save(retriever_cache_file, retriever_cache_embeddings_file)
+    atomic_write_json(
+        status_path,
+        {
+            'sample_id': sample_idx,
+            'next_turn_index': next_turn_index,
+            'total_turns': total_turns,
+            'complete': complete,
+            'updated_at': datetime.utcnow().isoformat() + 'Z',
+        },
+    )
+
+
+def restore_existing_results(output_path: Optional[str], eval_logger: logging.Logger):
+    if not output_path or not os.path.exists(output_path):
+        return [], [], [], defaultdict(int), set()
+    payload = load_json_file(output_path)
+    existing_results = payload.get('individual_results', []) if isinstance(payload, dict) else []
+    all_metrics = []
+    all_categories = []
+    category_counts = defaultdict(int)
+    completed_result_keys = set()
+    for entry in existing_results:
+        category = int(entry.get('category', 0))
+        qa_index = int(entry.get('qa_index', 0))
+        sample_id = int(entry.get('sample_id', 0))
+        question = entry.get('question', '')
+        completed_result_keys.add(build_locomo_result_key(sample_id, qa_index, category, question))
+        category_counts[category] += 1
+        if entry.get('metrics') is not None:
+            all_metrics.append(entry['metrics'])
+            all_categories.append(category)
+    eval_logger.info('Resuming from %d existing QA results in %s', len(existing_results), output_path)
+    return existing_results, all_metrics, all_categories, category_counts, completed_result_keys
+
+
+def persist_locomo_results(
+    output_path: Optional[str],
+    model: str,
+    dataset_path: str,
+    category_counts: Dict[int, int],
+    all_metrics: List[Dict[str, Any]],
+    all_categories: List[int],
+    results: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    aggregate_results = aggregate_metrics(all_metrics, all_categories) if all_metrics else {}
+    final_results = {
+        'model': model,
+        'dataset': dataset_path,
+        'memory_layer': 'robust',
+        'total_questions': len(results),
+        'category_distribution': {str(cat): count for cat, count in category_counts.items()},
+        'aggregate_metrics': aggregate_results,
+        'individual_results': results,
+    }
+    if output_path:
+        atomic_write_json(output_path, final_results)
+    return final_results
 
 
 def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] = None,
@@ -232,11 +340,8 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                    if position % num_workers == worker_id]
         eval_logger.info(f"Worker {worker_id}/{num_workers} processing {len(samples)} samples")
 
-    results = []
-    all_metrics = []
-    all_categories = []
-    total_questions = 0
-    category_counts = defaultdict(int)
+    results, all_metrics, all_categories, category_counts, completed_result_keys = restore_existing_results(output_path, eval_logger)
+    total_questions = len(results)
 
     i = 0
     error_num = 0
@@ -268,12 +373,17 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
             memories_dir, f"retriever_cache_embeddings_sample_{sample_idx}.npy"
         )
 
+        build_status_file = robust_build_status_path(memories_dir, sample_idx)
+        build_status = load_json_file(build_status_file)
+        turn_entries = flatten_sample_turns(sample)
+        resume_turn_index = 0
+
         if os.path.exists(memory_cache_file):
             eval_logger.info(f"Loading cached memories for sample {sample_idx}")
             with open(memory_cache_file, 'rb') as f:
                 cached_memories = pickle.load(f)
             agent.memory_system.memories = cached_memories
-            if os.path.exists(retriever_cache_file):
+            if os.path.exists(retriever_cache_file) and os.path.exists(retriever_cache_embeddings_file):
                 eval_logger.info(f"Found retriever cache files")
                 agent.memory_system.retriever = agent.memory_system.retriever.load(
                     retriever_cache_file, retriever_cache_embeddings_file
@@ -283,92 +393,136 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                 agent.memory_system.retriever = agent.memory_system.retriever.load_from_local_memory(
                     cached_memories, 'all-MiniLM-L6-v2'
                 )
+            resume_turn_index = int(build_status.get('next_turn_index', 0) or 0)
+            if build_status.get('complete') or not build_status:
+                resume_turn_index = len(turn_entries)
             eval_logger.info(f"Successfully loaded {len(cached_memories)} memories")
         else:
             eval_logger.info(f"No cached memories found for sample {sample_idx}. Creating new memories.")
-            total_turns = sum(len(turns.turns) for turns in sample.conversation.sessions.values())
-            build_progress = tqdm(total=total_turns, desc=f"Build {sample_idx}", unit="turn", leave=False)
 
-            for _, turns in sample.conversation.sessions.items():
-                for turn in turns.turns:
-                    turn_datatime = turns.date_time
-                    conversation_tmp = "Speaker " + turn.speaker + "says : " + turn.text
-                    agent.add_memory(conversation_tmp, time=turn_datatime)
-                    build_progress.update(1)
+        if resume_turn_index < len(turn_entries):
+            total_turns = len(turn_entries)
+            if resume_turn_index > 0:
+                eval_logger.info(
+                    "Resuming memory build for sample %s from turn %s/%s",
+                    sample_idx,
+                    resume_turn_index,
+                    total_turns,
+                )
+            build_progress = tqdm(
+                total=total_turns,
+                initial=resume_turn_index,
+                desc=f"Build {sample_idx}",
+                unit="turn",
+                leave=False,
+            )
+
+            for turn_idx, (turn_datetime, turn) in enumerate(turn_entries[resume_turn_index:], start=resume_turn_index):
+                conversation_tmp = "Speaker " + turn.speaker + "says : " + turn.text
+                agent.add_memory(conversation_tmp, time=turn_datetime)
+                build_progress.update(1)
+                save_robust_build_checkpoint(
+                    agent,
+                    memory_cache_file,
+                    retriever_cache_file,
+                    retriever_cache_embeddings_file,
+                    build_status_file,
+                    sample_idx,
+                    turn_idx + 1,
+                    total_turns,
+                    complete=False,
+                )
 
             build_progress.close()
-            memories_to_cache = agent.memory_system.memories
-            with open(memory_cache_file, 'wb') as f:
-                pickle.dump(memories_to_cache, f)
-            agent.memory_system.retriever.save(retriever_cache_file, retriever_cache_embeddings_file)
-            eval_logger.info(f"Successfully cached {len(memories_to_cache)} memories")
+            save_robust_build_checkpoint(
+                agent,
+                memory_cache_file,
+                retriever_cache_file,
+                retriever_cache_embeddings_file,
+                build_status_file,
+                sample_idx,
+                len(turn_entries),
+                len(turn_entries),
+                complete=True,
+            )
+            eval_logger.info(f"Successfully cached {len(agent.memory_system.memories)} memories")
 
         eval_logger.info(f"Processing sample {shard_idx + 1}/{len(samples)} (dataset sample {sample_idx})")
 
         qa_progress = tqdm(sample.qa, desc=f"QA {sample_idx}", unit="qa", leave=False)
-        for qa in qa_progress:
-            if int(qa.category) in allow_categories:
-                total_questions += 1
-                qa_progress.set_postfix_str(f"global={total_questions}/{total_qas_in_run} cat={qa.category}")
-                category_counts[qa.category] += 1
+        for qa_idx, qa in enumerate(qa_progress):
+            if int(qa.category) not in allow_categories:
+                continue
 
-                prompt_answer = get_locomo_prompt_answer(qa.category, qa.answer, qa.adversarial_answer)
-                reference_answer = get_locomo_reference_answer(qa.category, qa.answer)
-                prediction, user_prompt, raw_context = agent.answer_question(
-                    qa.question, qa.category, prompt_answer
-                )
+            qa_key = build_locomo_result_key(sample_idx, qa_idx, int(qa.category), qa.question)
+            if qa_key in completed_result_keys:
+                continue
 
-                # Parse the prediction (handles both JSON and plain text)
-                prediction = parse_plain_text_answer(prediction)
+            total_questions += 1
+            qa_progress.set_postfix_str(f"global={total_questions}/{total_qas_in_run} cat={qa.category}")
+            category_counts[qa.category] += 1
 
-                eval_logger.info(f"Question {total_questions}: {qa.question}")
-                eval_logger.info(f"Prediction: {prediction}")
-                eval_logger.info(f"Reference: {reference_answer}")
-                eval_logger.info(f"Adversarial Answer: {qa.adversarial_answer}")
-                eval_logger.info(f"User Prompt: {user_prompt}")
-                eval_logger.info(f"Category: {qa.category}")
-                eval_logger.info(f"Raw Context: {raw_context}")
+            prompt_answer = get_locomo_prompt_answer(qa.category, qa.answer, qa.adversarial_answer)
+            reference_answer = get_locomo_reference_answer(qa.category, qa.answer)
+            prediction, user_prompt, raw_context = agent.answer_question(
+                qa.question, qa.category, prompt_answer
+            )
 
-                metrics = calculate_locomo_official_metrics(prediction, reference_answer, qa.category)
+            prediction = parse_plain_text_answer(prediction)
 
-                all_metrics.append(metrics)
-                all_categories.append(qa.category)
+            eval_logger.info(f"Question {total_questions}: {qa.question}")
+            eval_logger.info(f"Prediction: {prediction}")
+            eval_logger.info(f"Reference: {reference_answer}")
+            eval_logger.info(f"Adversarial Answer: {qa.adversarial_answer}")
+            eval_logger.info(f"User Prompt: {user_prompt}")
+            eval_logger.info(f"Category: {qa.category}")
+            eval_logger.info(f"Raw Context: {raw_context}")
 
-                result = {
-                    "sample_id": sample_idx,
-                    "question": qa.question,
-                    "prediction": prediction,
-                    "reference": reference_answer,
-                    "adversarial_answer": qa.adversarial_answer,
-                    "category": qa.category,
-                    "user_prompt": user_prompt,
-                    "raw_context": raw_context,
-                    "metrics": metrics,
-                    "evaluation_protocol": "official_locomo",
-                }
-                results.append(result)
+            metrics = calculate_locomo_official_metrics(prediction, reference_answer, qa.category)
 
-                if total_questions % 10 == 0:
-                    eval_logger.info(f"Processed {total_questions} questions")
+            all_metrics.append(metrics)
+            all_categories.append(qa.category)
 
-    aggregate_results = aggregate_metrics(all_metrics, all_categories)
+            result = {
+                "sample_id": sample_idx,
+                "qa_index": qa_idx,
+                "question": qa.question,
+                "prediction": prediction,
+                "reference": reference_answer,
+                "adversarial_answer": qa.adversarial_answer,
+                "category": qa.category,
+                "user_prompt": user_prompt,
+                "raw_context": raw_context,
+                "metrics": metrics,
+                "evaluation_protocol": "official_locomo",
+            }
+            results.append(result)
+            completed_result_keys.add(qa_key)
+            persist_locomo_results(
+                output_path,
+                model,
+                dataset_path,
+                category_counts,
+                all_metrics,
+                all_categories,
+                results,
+            )
 
-    final_results = {
-        "model": model,
-        "dataset": dataset_path,
-        "memory_layer": "robust",
-        "total_questions": total_questions,
-        "category_distribution": {
-            str(cat): count for cat, count in category_counts.items()
-        },
-        "aggregate_metrics": aggregate_results,
-        "individual_results": results,
-    }
+            if total_questions % 10 == 0:
+                eval_logger.info(f"Processed {total_questions} questions")
+
+    final_results = persist_locomo_results(
+        output_path,
+        model,
+        dataset_path,
+        category_counts,
+        all_metrics,
+        all_categories,
+        results,
+    )
     eval_logger.info(f"Error number: {error_num}")
 
     if output_path:
-        with open(output_path, 'w') as f:
-            json.dump(final_results, f, indent=2)
         eval_logger.info(f"Results saved to {output_path}")
 
     eval_logger.info("Evaluation Summary:")

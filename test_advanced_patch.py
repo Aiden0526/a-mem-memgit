@@ -14,6 +14,7 @@ from collections import defaultdict
 from dotenv import load_dotenv
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from tqdm.auto import tqdm
 from load_dataset import load_locomo_dataset
 from locomo_eval_utils import get_locomo_prompt_answer, get_locomo_reference_answer
@@ -63,6 +64,92 @@ def resolve_local_backend_endpoint(
     if backend == "vllm":
         return vllm_host or sglang_host, vllm_port or sglang_port
     return sglang_host, sglang_port
+
+
+def atomic_write_json(path: str, payload: dict[str, Any]) -> None:
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
+def build_patch_result_key(sample_id: Any, qa_index: int, category: int, question: str) -> str:
+    return json.dumps([str(sample_id), int(qa_index), int(category), question], ensure_ascii=False)
+
+
+def load_existing_patch_result(inventory_output: str | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], defaultdict[int, int], set[str]]:
+    if not inventory_output or not os.path.exists(inventory_output):
+        return [], [], defaultdict(int), set()
+    try:
+        with open(inventory_output, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+    except Exception:
+        return [], [], defaultdict(int), set()
+    qa_results = payload.get('qa_results', []) if isinstance(payload, dict) else []
+    sample_patch_summaries = payload.get('sample_patch_summaries', []) if isinstance(payload, dict) else []
+    category_counts = defaultdict(int)
+    completed_result_keys: set[str] = set()
+    for row in qa_results:
+        category = int(row.get('category', 0))
+        category_counts[category] += 1
+        completed_result_keys.add(
+            build_patch_result_key(
+                row.get('sample_id'),
+                int(row.get('qa_index', 0)),
+                category,
+                row.get('question', ''),
+            )
+        )
+    return qa_results, sample_patch_summaries, category_counts, completed_result_keys
+
+
+def persist_patch_result(
+    inventory_output: str | None,
+    model: str,
+    dataset_path: str,
+    patch_usage: str,
+    samples: int,
+    category_counts: defaultdict[int, int],
+    qa_results: list[dict[str, Any]],
+    sample_patch_summaries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    all_metrics = [row['metrics'] for row in qa_results if row.get('metrics') is not None]
+    all_categories = [row['category'] for row in qa_results if row.get('metrics') is not None and row.get('category') is not None]
+    aggregate_results = aggregate_metrics(all_metrics, all_categories) if all_metrics else {}
+    result = {
+        'model': model,
+        'dataset': dataset_path,
+        'memory_layer': 'patch',
+        'patch_usage': patch_usage,
+        'samples': samples,
+        'total_questions': len(qa_results),
+        'category_counts': dict(category_counts),
+        'aggregate_metrics': aggregate_results,
+        'sample_patch_summaries': sample_patch_summaries,
+        'qa_results': qa_results,
+    }
+    if inventory_output:
+        atomic_write_json(inventory_output, result)
+    return result
+
+
+def flatten_locomo_sample_turns(sample) -> list[tuple[int, Any, int, Any]]:
+    turn_entries = []
+    for session_id, turns in sample.conversation.sessions.items():
+        for turn_position, turn in enumerate(turns.turns):
+            turn_entries.append((session_id, turns, turn_position, turn))
+    return turn_entries
+
+
+def resolve_patch_resume_index(memory_system: PatchAugmentedMemorySystem, turn_entries: list[tuple[int, Any, int, Any]]) -> int:
+    status = memory_system.get_build_status()
+    last_session_id = status.get('last_session_id')
+    last_turn_position = status.get('last_turn_position')
+    if last_session_id is not None and last_turn_position is not None:
+        for idx, (session_id, _turns, turn_position, _turn) in enumerate(turn_entries):
+            if session_id == last_session_id and turn_position == last_turn_position:
+                return idx + 1
+    return min(memory_system.get_resume_turn_index(), len(turn_entries))
 
 
 class PatchAdvancedMemAgent:
@@ -203,14 +290,9 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
         patch_hybrid_node_rerank=patch_hybrid_node_rerank,
         cache_root=cache_root,
     )
-    category_counts = defaultdict(int)
-    all_metrics = []
-    all_categories = []
-    total_questions = 0
+    qa_results, sample_patch_summaries, category_counts, completed_result_keys = load_existing_patch_result(inventory_output)
+    total_questions = len(qa_results)
     total_qas_in_run = sum(len(sample.qa) for sample in samples) if not skip_qa else 0
-
-    sample_patch_summaries = []
-    qa_results = []
 
     sample_progress = tqdm(samples, desc="Samples", unit="sample")
     for sample_idx, sample in enumerate(sample_progress):
@@ -219,23 +301,36 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
         if agent.memory_system.has_complete_global_graph_cache():
             logger.info("sample=%s loaded complete global graph cache; skipping rebuild", sample.sample_id)
         else:
-            total_turns = sum(len(turns.turns) for turns in sample.conversation.sessions.values())
-            turn_progress = tqdm(total=total_turns, desc=f"Build {sample.sample_id}", unit="turn", leave=False)
-            for session_id, turns in sample.conversation.sessions.items():
-                for turn_position, turn in enumerate(turns.turns):
-                    conversation_tmp = "Speaker " + turn.speaker + " says : " + turn.text
-                    agent.add_memory(
-                        conversation_tmp,
-                        time=turns.date_time,
-                        session_id=session_id,
-                        session_date_time=turns.date_time,
-                        session_summary=sample.session_summary.get(f"session_{session_id}_summary", ""),
-                        turn_position=turn_position,
-                        turn_number=turn_position + 1,
-                        dia_id=turn.dia_id,
-                        speaker=turn.speaker,
-                    )
-                    turn_progress.update(1)
+            turn_entries = flatten_locomo_sample_turns(sample)
+            resume_turn_index = resolve_patch_resume_index(agent.memory_system, turn_entries)
+            if resume_turn_index > 0:
+                logger.info(
+                    "sample=%s resuming patch build from turn %s/%s",
+                    sample.sample_id,
+                    resume_turn_index,
+                    len(turn_entries),
+                )
+            turn_progress = tqdm(
+                total=len(turn_entries),
+                initial=resume_turn_index,
+                desc=f"Build {sample.sample_id}",
+                unit="turn",
+                leave=False,
+            )
+            for global_turn_index, (session_id, turns, turn_position, turn) in enumerate(turn_entries[resume_turn_index:], start=resume_turn_index):
+                conversation_tmp = "Speaker " + turn.speaker + " says : " + turn.text
+                agent.add_memory(
+                    conversation_tmp,
+                    time=turns.date_time,
+                    session_id=session_id,
+                    session_date_time=turns.date_time,
+                    session_summary=sample.session_summary.get(f"session_{session_id}_summary", ""),
+                    turn_position=turn_position,
+                    turn_number=global_turn_index + 1,
+                    dia_id=turn.dia_id,
+                    speaker=turn.speaker,
+                )
+                turn_progress.update(1)
             turn_progress.close()
             agent.memory_system.mark_sample_complete()
 
@@ -244,6 +339,7 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
         patch_files = sorted(str(p.name) for p in patch_dir.glob("patch_*.json"))
         patch_summary["patch_dir"] = str(patch_dir)
         patch_summary["patch_files"] = patch_files
+        sample_patch_summaries = [s for s in sample_patch_summaries if str(s.get('sample_id')) != str(sample.sample_id)]
         sample_patch_summaries.append(patch_summary)
         logger.info(
             "patch_inventory sample=%s patches=%s types=%s avg_changed_nodes=%.2f max_changed_nodes=%s sessions=%s patch_dir=%s patch_files=%s",
@@ -256,12 +352,26 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
             patch_summary["patch_dir"],
             patch_summary["patch_files"],
         )
+        persist_patch_result(
+            inventory_output,
+            model,
+            dataset_path,
+            patch_usage,
+            len(samples),
+            category_counts,
+            qa_results,
+            sample_patch_summaries,
+        )
 
         if skip_qa:
             continue
 
         qa_progress = tqdm(sample.qa, desc=f"QA {sample.sample_id}", unit="qa", leave=False)
         for qa_idx, qa in enumerate(qa_progress):
+            qa_key = build_patch_result_key(sample.sample_id, qa_idx, int(qa.category), qa.question)
+            if qa_key in completed_result_keys:
+                continue
+
             total_questions += 1
             qa_progress.set_postfix_str(f"global={total_questions}/{total_qas_in_run} cat={qa.category}")
             logger.info(
@@ -282,8 +392,6 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
             )
             prediction = parse_plain_text_answer(prediction)
             metrics = calculate_locomo_official_metrics(prediction, reference_answer, qa.category)
-            all_metrics.append(metrics)
-            all_categories.append(qa.category)
             qa_results.append({
                 "sample_index": sample_idx,
                 "sample_id": sample.sample_id,
@@ -299,28 +407,33 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
                 "answer_metadata": answer_metadata,
                 "evaluation_protocol": "official_locomo",
             })
+            completed_result_keys.add(qa_key)
+            persist_patch_result(
+                inventory_output,
+                model,
+                dataset_path,
+                patch_usage,
+                len(samples),
+                category_counts,
+                qa_results,
+                sample_patch_summaries,
+            )
             logger.info("sample=%s category=%s question=%s prediction=%s", sample_idx, qa.category, qa.question, prediction)
             logger.debug("prompt=%s", user_prompt)
             logger.debug("context=%s", raw_context)
         qa_progress.close()
 
     sample_progress.close()
-    aggregate_results = aggregate_metrics(all_metrics, all_categories) if all_metrics else {}
-    result = {
-        "model": model,
-        "dataset": dataset_path,
-        "memory_layer": "patch",
-        "patch_usage": patch_usage,
-        "samples": len(samples),
-        "total_questions": total_questions,
-        "category_counts": dict(category_counts),
-        "aggregate_metrics": aggregate_results,
-        "sample_patch_summaries": sample_patch_summaries,
-        "qa_results": qa_results,
-    }
-    if inventory_output:
-        with open(inventory_output, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
+    result = persist_patch_result(
+        inventory_output,
+        model,
+        dataset_path,
+        patch_usage,
+        len(samples),
+        category_counts,
+        qa_results,
+        sample_patch_summaries,
+    )
     return result
 
 

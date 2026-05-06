@@ -31,6 +31,7 @@ from test_persona_robust import (
     create_mcq_options,
     extract_final_answer,
     load_benchmark_rows,
+    load_existing_output_rows,
     load_chat_history_messages,
     make_progress,
     normalize_openai_env,
@@ -733,11 +734,21 @@ class AgentManager:
         if agent.has_cached_state():
             self.eval_logger.info("Loading cached patch A-MEM state for %s", chat_history_path.name)
         else:
-            self.eval_logger.info("Building patch A-MEM state for %s", chat_history_path.name)
             messages = load_chat_history_messages(chat_history_path)
-            loaded_messages = 0
+            resume_message_index = agent.memory_system.get_resume_turn_index() if agent.memory_system is not None else 0
+            if resume_message_index > 0:
+                self.eval_logger.info(
+                    "Resuming patch A-MEM state for %s from message %s/%s",
+                    chat_history_path.name,
+                    resume_message_index,
+                    len(messages),
+                )
+            else:
+                self.eval_logger.info("Building patch A-MEM state for %s", chat_history_path.name)
+            loaded_messages = resume_message_index
             for idx, message in enumerate(
-                make_progress(messages, desc=f"Build patch memory {chat_history_path.stem}", leave=False)
+                make_progress(messages[resume_message_index:], desc=f"Build patch memory {chat_history_path.stem}", leave=False),
+                start=resume_message_index,
             ):
                 role = str(message.get("role", "")).lower()
                 if not self.include_system_messages and role == "system":
@@ -905,15 +916,23 @@ def evaluate_persona_benchmark(
             output_fieldnames.append(column)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    written_rows: List[Dict[str, str]] = []
-    correct = 0
-    mcq_processed = 0
+    existing_rows, existing_fieldnames = load_existing_output_rows(output_path)
+    if existing_fieldnames:
+        output_fieldnames = existing_fieldnames
+    resume_row_index = len(existing_rows)
+    if resume_row_index:
+        eval_logger.info("Resuming from %d existing result rows in %s", resume_row_index, output_path)
+    written_rows: List[Dict[str, str]] = list(existing_rows)
+    correct = sum(1 for row in written_rows if row.get(f"is_correct_mcq_{size}") == "True")
+    mcq_processed = sum(1 for row in written_rows if row.get(f"is_correct_mcq_{size}") in ("True", "False"))
 
-    with output_path.open("w", encoding="utf-8", newline="") as f:
+    file_mode = "a" if resume_row_index else "w"
+    with output_path.open(file_mode, encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=output_fieldnames)
-        writer.writeheader()
+        if not resume_row_index:
+            writer.writeheader()
 
-        for idx, row in enumerate(make_progress(rows, desc="Persona patch eval")):
+        for idx, row in enumerate(make_progress(rows[resume_row_index:], desc="Persona patch eval"), start=resume_row_index):
             output_row = row.copy()
             try:
                 chat_history_path = resolve_chat_history_path(row, size=size, persona_root=persona_root)

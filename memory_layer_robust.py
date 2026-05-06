@@ -44,6 +44,22 @@ logger = logging.getLogger("amem_robust")
 raw_logger = logging.getLogger("amem_robust_raw")
 
 
+def require_text_completion_content(response, model: str) -> str:
+    try:
+        choice = response.choices[0]
+        message = choice.message
+        content = message.content
+    except Exception as exc:
+        raise RuntimeError(f"Malformed completion response from {model}: {exc}") from exc
+    if content is None:
+        finish_reason = getattr(choice, "finish_reason", None)
+        tool_calls = getattr(message, "tool_calls", None)
+        raise RuntimeError(
+            f"LLM returned no text content for model={model}; finish_reason={finish_reason!r}; tool_calls={tool_calls!r}"
+        )
+    return content
+
+
 def normalize_openai_compatible_base_url(api_base: Optional[str]) -> Optional[str]:
     """
     Normalize an OpenAI-compatible base URL.
@@ -205,7 +221,7 @@ class RobustOpenAIController(RobustBaseLLMController):
             timeout=180.0,
         )
         elapsed = time.time() - start_time
-        content = response.choices[0].message.content
+        content = require_text_completion_content(response, self.model)
         logger.info(
             "LLM request done model=%s digest=%s elapsed=%.2fs response_chars=%d",
             self.model, prompt_digest, elapsed, len(content or ""),
@@ -322,7 +338,7 @@ class RobustLiteLLMController(RobustBaseLLMController):
         )
 
     @retry_llm_call(max_retries=2)
-    def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
+    def get_completion(self, prompt: str, temperature: float = 0.7, max_tokens: Optional[int] = None) -> str:
         completion_args = {
             "model": self.model,
             "messages": [
@@ -331,13 +347,15 @@ class RobustLiteLLMController(RobustBaseLLMController):
             ],
             "temperature": temperature,
         }
+        if max_tokens is not None:
+            completion_args["max_completion_tokens"] = max_tokens
         if self.api_base:
             completion_args["api_base"] = self.api_base
         if self.api_key:
             completion_args["api_key"] = self.api_key
 
         response = self._completion(**completion_args)
-        return response.choices[0].message.content
+        return require_text_completion_content(response, self.model)
 
 
 # ---------------------------------------------------------------------------

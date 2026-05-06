@@ -181,8 +181,6 @@ class PatchAugmentedMemorySystem:
             return
         memory_cache_file, retriever_cache_file, retriever_cache_embeddings_file = self.store.global_graph_paths(self.sample_id)
         status = self.store.load_build_status(self.sample_id) or {}
-        if not status.get('global_graph_complete', False):
-            return
         if not (
             os.path.exists(memory_cache_file)
             and os.path.exists(retriever_cache_file)
@@ -194,7 +192,26 @@ class PatchAugmentedMemorySystem:
         self.base_system.retriever = self.base_system.retriever.load(
             retriever_cache_file, retriever_cache_embeddings_file
         )
-        self.loaded_from_complete_cache = True
+        self.loaded_from_complete_cache = bool(status.get('global_graph_complete', False))
+
+    def get_build_status(self) -> Dict[str, Any]:
+        return self.store.load_build_status(self.sample_id) or {}
+
+    def get_resume_turn_index(self) -> int:
+        status = self.get_build_status()
+        last_turn_number = status.get("last_turn_number")
+        if last_turn_number is not None:
+            try:
+                return max(0, int(last_turn_number))
+            except (TypeError, ValueError):
+                pass
+        last_turn_position = status.get("last_turn_position")
+        if last_turn_position is not None:
+            try:
+                return max(0, int(last_turn_position) + 1)
+            except (TypeError, ValueError):
+                pass
+        return 0
 
     def _save_global_graph_cache(
         self,

@@ -16,7 +16,7 @@ fi
 # =========================
 
 # Which runner to launch by default if you do not pass [robust|patch|both].
-CONFIG_RUN_TARGET="robust" # robust, patch, or both
+CONFIG_RUN_TARGET="patch" # robust, patch, or both
 
 # LLM backend/provider flag passed through to the Persona runner.
 # Examples: openai, openrouter, vllm, sglang.
@@ -62,8 +62,8 @@ CONFIG_LITELLM_LOG="WARNING"
 
 # Default model list. You can also override with MODEL_LIST=a,b,c.
 CONFIG_MODELS=(
-  "moonshotai/kimi-k2.6"
-  # "google/gemini-3.1-pro-preview-customtools",
+  # "moonshotai/kimi-k2.6"
+  "google/gemini-3.1-pro-preview-customtools"
   # "qwen/qwen3.6-27b"
 )
 
@@ -98,6 +98,11 @@ CONFIG_PREFERENCE_AWARE="1"
 # full       = preference-aware everywhere; equivalent to legacy --preference_aware
 CONFIG_PREFERENCE_AWARE_LEVEL="none"
 
+# Resume behavior.
+# 1 = reuse stable output/cache paths and let the Python runner resume in place.
+# 0 = refuse to reuse an existing output path.
+CONFIG_RESUME="1"
+
 # -------------------------
 # Patch-only knobs
 # -------------------------
@@ -116,7 +121,7 @@ CONFIG_MIN_PATCH_SIMILARITY="0.4"
 
 # Whether to rebuild / reingest patch memories instead of reusing cached ones.
 # 1 = force rebuild, 0 = reuse existing cache when available.
-CONFIG_FORCE_REINGEST_PATCHES="1"
+CONFIG_FORCE_REINGEST_PATCHES="0"
 
 # Exclude revoke-type patches from retrieval/injection.
 # Usually leave this at 0 unless you are doing an ablation.
@@ -179,6 +184,7 @@ Common overrides:
   MAX_ITEMS              Optional max benchmark rows
   INCLUDE_DEBUG_COLUMNS  1 to write prompts/contexts/metadata to output
   CACHE_ROOT             Optional cache directory override
+  RESUME                 1 to automatically resume from existing outputs/caches
   PREFERENCE_AWARE       1 to use legacy preference-aware mode
   PREFERENCE_AWARE_LEVEL none|patch_only|full
 
@@ -186,7 +192,7 @@ Patch-only overrides:
   PATCH_TOP_K
   PATCH_USAGE
   MIN_PATCH_SIMILARITY
-  FORCE_REINGEST_PATCHES 1 or 0
+  FORCE_REINGEST_PATCHES 1 or 0 (set this to 0 for resume)
   EXCLUDE_REVOKE_PATCHES 1 or 0
   EXCLUDE_ADD_PATCHES    1 or 0
   REQUIRE_PREF_CHANGE    1 or 0
@@ -235,6 +241,7 @@ PERSONA_IDS="${PERSONA_IDS:-$CONFIG_PERSONA_IDS}"
 MAX_ITEMS="${MAX_ITEMS:-$CONFIG_MAX_ITEMS}"
 INCLUDE_DEBUG_COLUMNS="${INCLUDE_DEBUG_COLUMNS:-$CONFIG_INCLUDE_DEBUG_COLUMNS}"
 CACHE_ROOT="${CACHE_ROOT:-$CONFIG_CACHE_ROOT}"
+RESUME="${RESUME:-$CONFIG_RESUME}"
 PREFERENCE_AWARE="${PREFERENCE_AWARE:-$CONFIG_PREFERENCE_AWARE}"
 PREFERENCE_AWARE_LEVEL="${PREFERENCE_AWARE_LEVEL:-$CONFIG_PREFERENCE_AWARE_LEVEL}"
 
@@ -295,6 +302,26 @@ if [[ -n "$API_BASE" ]]; then
   export OPENAI_BASE_URL="$API_BASE"
 fi
 export LITELLM_LOG="$LITELLM_LOG_LEVEL"
+
+ensure_resume_ready() {
+  local output_path="$1"
+  local label="$2"
+
+  if [[ "$RESUME" == "1" || "$RESUME" == "true" || "$RESUME" == "TRUE" ]]; then
+    if [[ -f "$output_path" ]]; then
+      echo "Resume enabled: reusing existing $label output $output_path"
+    else
+      echo "Resume enabled: starting fresh $label output $output_path"
+    fi
+    return 0
+  fi
+
+  if [[ -f "$output_path" ]]; then
+    echo "$label output already exists and RESUME=0: $output_path" >&2
+    echo "Either set RESUME=1 to continue, or change OUTPUT_DIR / model / benchmark target." >&2
+    exit 1
+  fi
+}
 
 sanitize() {
   local value="$1"
@@ -393,6 +420,7 @@ print_resolved_config() {
   echo "persona_ids: ${PERSONA_IDS:-ALL} | max_items: ${MAX_ITEMS:-ALL}"
   echo "preference_aware_level: $PREFERENCE_AWARE_LEVEL | legacy_preference_aware: $PREFERENCE_AWARE"
   echo "output_dir: $OUTPUT_DIR | cache_root: ${CACHE_ROOT:-AUTO} | litellm_log: $LITELLM_LOG_LEVEL"
+  echo "resume: $RESUME"
   if [[ "$RUN_TARGET" == "patch" || "$RUN_TARGET" == "both" ]]; then
     echo "patch_top_k: $PATCH_TOP_K | patch_usage: $PATCH_USAGE | min_patch_similarity: $MIN_PATCH_SIMILARITY"
     echo "force_reingest_patches: $FORCE_REINGEST_PATCHES | gt_patch: $GT_PATCH | gp_patch_retrieval: $GP_PATCH_RETRIEVAL"
@@ -401,6 +429,13 @@ print_resolved_config() {
 }
 
 print_resolved_config
+
+if [[ "$RUN_TARGET" == "patch" || "$RUN_TARGET" == "both" ]]; then
+  if [[ ("$RESUME" == "1" || "$RESUME" == "true" || "$RESUME" == "TRUE") && ("$FORCE_REINGEST_PATCHES" == "1" || "$FORCE_REINGEST_PATCHES" == "true" || "$FORCE_REINGEST_PATCHES" == "TRUE") ]]; then
+    echo "RESUME=1 is incompatible with FORCE_REINGEST_PATCHES=1. Set FORCE_REINGEST_PATCHES=0 to resume Persona patch runs." >&2
+    exit 1
+  fi
+fi
 
 benchmark_tag="$(basename "$BENCHMARK_FILE" .csv)"
 
@@ -419,6 +454,7 @@ for model in "${MODELS[@]}"; do
       "${common_args[@]}"
       --output "$robust_output"
     )
+    ensure_resume_ready "$robust_output" "Persona robust"
     echo "Running robust baseline -> $robust_output"
     "${robust_cmd[@]}"
   fi
@@ -433,6 +469,7 @@ for model in "${MODELS[@]}"; do
       "${patch_args[@]}"
       --output "$patch_output"
     )
+    ensure_resume_ready "$patch_output" "Persona patch"
     echo "Running patch variant -> $patch_output"
     "${patch_cmd[@]}"
   fi
