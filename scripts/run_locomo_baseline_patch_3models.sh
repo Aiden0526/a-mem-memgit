@@ -151,10 +151,9 @@ sanitize() {
   echo "$value"
 }
 
-build_common_args() {
+set_common_args() {
   local model="$1"
-  local -n out_ref=$2
-  out_ref=(
+  COMMON_ARGS=(
     --backend "$BACKEND"
     --model "$model"
     --api_key "$API_KEY"
@@ -166,11 +165,11 @@ build_common_args() {
   )
 
   if [[ -n "$END_SAMPLE" ]]; then
-    out_ref+=(--end_sample "$END_SAMPLE")
+    COMMON_ARGS+=(--end_sample "$END_SAMPLE")
   fi
 
   if [[ -n "$BATCH" ]]; then
-    out_ref+=(--batch "$BATCH")
+    COMMON_ARGS+=(--batch "$BATCH")
   fi
 }
 
@@ -192,8 +191,8 @@ print_resolved_config
 for model in "${MODELS[@]}"; do
   patch_cache_root=""
   safe_model="$(sanitize "$model")"
-  common_args=()
-  build_common_args "$model" common_args
+  COMMON_ARGS=()
+  set_common_args "$model"
   if [[ -n "$PATCH_CACHE_ROOT_BASE" ]]; then
     mkdir -p "$PATCH_CACHE_ROOT_BASE"
     patch_cache_root="$PATCH_CACHE_ROOT_BASE/locomo_patch_${safe_model}"
@@ -206,7 +205,7 @@ for model in "${MODELS[@]}"; do
     robust_output="robust_results/locomo_robust_${safe_model}.json"
     robust_cmd=(
       python test_advanced_robust.py
-      "${common_args[@]}"
+      "${COMMON_ARGS[@]}"
       --retrieve_k "$RETRIEVE_K"
       --output "$robust_output"
     )
@@ -222,7 +221,7 @@ for model in "${MODELS[@]}"; do
     patch_output="patch_results/locomo_patch_${safe_model}.json"
     patch_cmd=(
       python test_advanced_patch.py
-      "${common_args[@]}"
+      "${COMMON_ARGS[@]}"
       --retrieve_k "$RETRIEVE_K"
       --patch_top_k "$PATCH_TOP_K"
       --patch_usage "$PATCH_USAGE"

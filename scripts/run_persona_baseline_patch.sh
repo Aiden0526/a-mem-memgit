@@ -333,21 +333,16 @@ sanitize() {
   echo "$value"
 }
 
-append_bool_flag() {
-  local flag_name="$1"
-  local flag_value="$2"
-  local -n args_ref=$3
-  case "$flag_value" in
-    1|true|TRUE|yes|YES)
-      args_ref+=("$flag_name")
-      ;;
+bool_enabled() {
+  case "$1" in
+    1|true|TRUE|yes|YES) return 0 ;;
+    *) return 1 ;;
   esac
 }
 
-build_common_args() {
+set_common_args() {
   local model="$1"
-  local -n out_ref=$2
-  out_ref=(
+  COMMON_ARGS=(
     --backend "$BACKEND"
     --model "$model"
     --benchmark_file "$BENCHMARK_FILE"
@@ -356,57 +351,72 @@ build_common_args() {
   )
 
   if [[ -n "$API_BASE" ]]; then
-    out_ref+=(--api_base "$API_BASE")
+    COMMON_ARGS+=(--api_base "$API_BASE")
   fi
   if [[ -n "$PERSONA_ROOT" ]]; then
-    out_ref+=(--persona_root "$PERSONA_ROOT")
+    COMMON_ARGS+=(--persona_root "$PERSONA_ROOT")
   fi
   if [[ -n "$PERSONA_IDS" ]]; then
-    out_ref+=(--persona_ids "$PERSONA_IDS")
+    COMMON_ARGS+=(--persona_ids "$PERSONA_IDS")
   fi
   if [[ -n "$MAX_ITEMS" ]]; then
-    out_ref+=(--max_items "$MAX_ITEMS")
+    COMMON_ARGS+=(--max_items "$MAX_ITEMS")
   fi
   if [[ -n "$BATCH" ]]; then
-    out_ref+=(--batch "$BATCH")
+    COMMON_ARGS+=(--batch "$BATCH")
   fi
   if [[ -n "$CACHE_ROOT" ]]; then
-    out_ref+=(--cache_root "$CACHE_ROOT")
+    COMMON_ARGS+=(--cache_root "$CACHE_ROOT")
   fi
 
   if [[ "$PREFERENCE_AWARE_LEVEL" != "none" ]]; then
-    out_ref+=(--preference_aware_level "$PREFERENCE_AWARE_LEVEL")
+    COMMON_ARGS+=(--preference_aware_level "$PREFERENCE_AWARE_LEVEL")
   else
-    append_bool_flag --preference_aware "$PREFERENCE_AWARE" out_ref
+    if bool_enabled "$PREFERENCE_AWARE"; then
+      COMMON_ARGS+=(--preference_aware)
+    fi
   fi
 
-  append_bool_flag --save_debug_columns "$INCLUDE_DEBUG_COLUMNS" out_ref
+  if bool_enabled "$INCLUDE_DEBUG_COLUMNS"; then
+    COMMON_ARGS+=(--save_debug_columns)
+  fi
 }
 
-build_patch_args() {
-  local -n out_ref=$1
-  out_ref=(
+set_patch_args() {
+  PATCH_ARGS=(
     --patch_top_k "$PATCH_TOP_K"
     --patch_usage "$PATCH_USAGE"
     --min_patch_similarity "$MIN_PATCH_SIMILARITY"
     --gp_patch_retrieval "$GP_PATCH_RETRIEVAL"
   )
 
-  append_bool_flag --force_reingest_patches "$FORCE_REINGEST_PATCHES" out_ref
-  append_bool_flag --exclude_revoke_patches "$EXCLUDE_REVOKE_PATCHES" out_ref
-  append_bool_flag --exclude_add_patches "$EXCLUDE_ADD_PATCHES" out_ref
-  append_bool_flag --require_pref_change "$REQUIRE_PREF_CHANGE" out_ref
-  append_bool_flag --llm_patch_filter "$LLM_PATCH_FILTER" out_ref
-  append_bool_flag --gt_patch "$GT_PATCH" out_ref
+  if bool_enabled "$FORCE_REINGEST_PATCHES"; then
+    PATCH_ARGS+=(--force_reingest_patches)
+  fi
+  if bool_enabled "$EXCLUDE_REVOKE_PATCHES"; then
+    PATCH_ARGS+=(--exclude_revoke_patches)
+  fi
+  if bool_enabled "$EXCLUDE_ADD_PATCHES"; then
+    PATCH_ARGS+=(--exclude_add_patches)
+  fi
+  if bool_enabled "$REQUIRE_PREF_CHANGE"; then
+    PATCH_ARGS+=(--require_pref_change)
+  fi
+  if bool_enabled "$LLM_PATCH_FILTER"; then
+    PATCH_ARGS+=(--llm_patch_filter)
+  fi
+  if bool_enabled "$GT_PATCH"; then
+    PATCH_ARGS+=(--gt_patch)
+  fi
 
   if [[ -n "$GT_PATCH_FILE" ]]; then
-    out_ref+=(--gt_patch_file "$GT_PATCH_FILE")
+    PATCH_ARGS+=(--gt_patch_file "$GT_PATCH_FILE")
   fi
   if [[ -n "$GT_PATCH_TOP_K" ]]; then
-    out_ref+=(--gt_patch_top_k "$GT_PATCH_TOP_K")
+    PATCH_ARGS+=(--gt_patch_top_k "$GT_PATCH_TOP_K")
   fi
   if [[ -n "$GT_PATCH_MIN_SIMILARITY" ]]; then
-    out_ref+=(--gt_patch_min_similarity "$GT_PATCH_MIN_SIMILARITY")
+    PATCH_ARGS+=(--gt_patch_min_similarity "$GT_PATCH_MIN_SIMILARITY")
   fi
 }
 
@@ -441,8 +451,8 @@ benchmark_tag="$(basename "$BENCHMARK_FILE" .csv)"
 
 for model in "${MODELS[@]}"; do
   safe_model="$(sanitize "$model")"
-  common_args=()
-  build_common_args "$model" common_args
+  COMMON_ARGS=()
+  set_common_args "$model"
 
   echo "============================================================"
   echo "Model: $model"
@@ -451,7 +461,7 @@ for model in "${MODELS[@]}"; do
     robust_output="$OUTPUT_DIR/persona_robust_${safe_model}_${benchmark_tag}.csv"
     robust_cmd=(
       python test_persona_robust.py
-      "${common_args[@]}"
+      "${COMMON_ARGS[@]}"
       --output "$robust_output"
     )
     ensure_resume_ready "$robust_output" "Persona robust"
@@ -461,12 +471,12 @@ for model in "${MODELS[@]}"; do
 
   if [[ "$RUN_TARGET" == "patch" || "$RUN_TARGET" == "both" ]]; then
     patch_output="$OUTPUT_DIR/persona_patch_${safe_model}_${benchmark_tag}.csv"
-    patch_args=()
-    build_patch_args patch_args
+    PATCH_ARGS=()
+    set_patch_args
     patch_cmd=(
       python test_persona_patch.py
-      "${common_args[@]}"
-      "${patch_args[@]}"
+      "${COMMON_ARGS[@]}"
+      "${PATCH_ARGS[@]}"
       --output "$patch_output"
     )
     ensure_resume_ready "$patch_output" "Persona patch"
