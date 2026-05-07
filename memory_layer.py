@@ -5,6 +5,7 @@ from datetime import datetime
 import uuid
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
+import logging
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 import os
@@ -18,6 +19,26 @@ from litellm import completion
 import requests
 import json as json_lib
 import time
+
+
+logger = logging.getLogger("memory_layer")
+
+def preferred_sentence_transformer_device() -> str:
+    try:
+        import torch
+    except ImportError:
+        logger.info("torch not available; using cpu for SentenceTransformer")
+        return "cpu"
+
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+def build_sentence_transformer(model_name: str) -> SentenceTransformer:
+    device = preferred_sentence_transformer_device()
+    logger.info("Loading SentenceTransformer model %s on device=%s", model_name, device)
+    return SentenceTransformer(model_name, device=device)
 
 def simple_tokenize(text):
     try:
@@ -415,7 +436,7 @@ class HybridRetriever:
             model_name: Name of the SentenceTransformer model to use
             alpha: Weight for combining BM25 and semantic scores (0 = only BM25, 1 = only semantic)
         """
-        self.model = SentenceTransformer(model_name)
+        self.model = build_sentence_transformer(model_name)
         self.alpha = alpha
         self.bm25 = None
         self.corpus = []
@@ -565,7 +586,7 @@ class SimpleEmbeddingRetriever:
         Args:
             model_name: Name of the SentenceTransformer model to use
         """
-        self.model = SentenceTransformer(model_name)
+        self.model = build_sentence_transformer(model_name)
         self.corpus = []
         self.embeddings = None
         self.document_ids = {}  # Map document content to its index

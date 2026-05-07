@@ -24,6 +24,7 @@ import numpy as np
 from load_dataset import load_locomo_dataset, QA, Turn, Session, Conversation
 import nltk
 from sentence_transformers import SentenceTransformer
+from memory_layer import preferred_sentence_transformer_device
 from sentence_transformers.util import pytorch_cos_sim
 import statistics
 from collections import defaultdict
@@ -45,7 +46,7 @@ except LookupError:
 
 # Initialize SentenceTransformer model (this will be reused)
 try:
-    sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+    sentence_model = SentenceTransformer('all-MiniLM-L6-v2', device=preferred_sentence_transformer_device())
 except Exception as e:
     print(f"Warning: Could not load SentenceTransformer model: {e}")
     sentence_model = None

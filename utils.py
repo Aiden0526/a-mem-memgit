@@ -11,6 +11,7 @@ import nltk
 from nltk.translate.meteor_score import meteor_score
 from nltk.tokenize import wordpunct_tokenize
 from sentence_transformers import SentenceTransformer
+from memory_layer import preferred_sentence_transformer_device
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,7 +28,7 @@ except Exception as e:
 
 # Initialize SentenceTransformer model (this will be reused)
 try:
-    sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+    sentence_model = SentenceTransformer('all-MiniLM-L6-v2', device=preferred_sentence_transformer_device())
 except Exception as e:
     print(f"Warning: Could not load SentenceTransformer model: {e}")
     sentence_model = None
