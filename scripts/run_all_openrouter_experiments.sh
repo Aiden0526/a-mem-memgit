@@ -19,13 +19,13 @@ CONFIG_API_KEY=""
 CONFIG_API_BASE="https://openrouter.ai/api/v1"
 CONFIG_BACKEND="openrouter"
 CONFIG_LOCOMO_MODELS=(
-  "moonshotai/kimi-k2.6"
+  # "moonshotai/kimi-k2.6"
   "qwen/qwen3.6-27b"
 )
 CONFIG_PERSONA_MODELS=(
-  "moonshotai/kimi-k2.6"
+  # "moonshotai/kimi-k2.6"
   "qwen/qwen3.6-27b"
-  "google/gemini-3.1-pro-preview"
+  # "google/gemini-3.1-pro-preview"
 )
 
 CONFIG_SUITE="all"
@@ -47,6 +47,7 @@ CONFIG_LOCOMO_DATASET="data/locomo10.json"
 CONFIG_LOCOMO_RATIO="1.0"
 CONFIG_LOCOMO_START_SAMPLE="0"
 CONFIG_LOCOMO_END_SAMPLE=""
+CONFIG_LOCOMO_SAMPLE_IDS=""
 CONFIG_LOCOMO_BATCH="9"
 CONFIG_LOCOMO_RETRIEVE_K="10"
 CONFIG_LOCOMO_PATCH_TOP_K="2"
@@ -364,6 +365,7 @@ print_config() {
   echo "API base: $API_BASE"
   echo "Venv: $VENV_DIR | Requirements: $REQUIREMENTS_FILE | reinstall_requirements: $REINSTALL_REQUIREMENTS"
   echo "Persona benchmark default: ${BENCHMARK_FILE:-$CONFIG_PERSONA_BENCHMARK_FILE}"
+  echo "LoCoMo sample_ids: ${SAMPLE_IDS:-$CONFIG_LOCOMO_SAMPLE_IDS} | Persona ids: ${PERSONA_IDS:-$CONFIG_PERSONA_PERSONA_IDS}"
   if [[ "$EXECUTION_MODE" != "sequential" ]]; then
     echo "job_name_prefix: ${JOB_NAME_PREFIX:-NONE} | job_log_dir: $JOB_LOG_DIR"
     if [[ "$EXECUTION_MODE" == "parallel" ]]; then
@@ -532,7 +534,8 @@ build_locomo_job_command() {
   local locomo_ratio="${RATIO:-$CONFIG_LOCOMO_RATIO}"
   local locomo_start_sample="${START_SAMPLE:-$CONFIG_LOCOMO_START_SAMPLE}"
   local locomo_end_sample="${END_SAMPLE:-$CONFIG_LOCOMO_END_SAMPLE}"
-  printf '%s' "cd $(shell_quote "$ROOT_DIR") && source $(shell_quote "$ROOT_DIR/$VENV_DIR/bin/activate") && BACKEND=$(shell_quote "$BACKEND") OPENAI_API_KEY=$(shell_quote "$API_KEY") OPENROUTER_API_KEY=$(shell_quote "$API_KEY") OPENAI_BASE_URL=$(shell_quote "$API_BASE") MODEL_LIST=$(shell_quote "$model") DATASET=$(shell_quote "$locomo_dataset") RATIO=$(shell_quote "$locomo_ratio") START_SAMPLE=$(shell_quote "$locomo_start_sample") END_SAMPLE=$(shell_quote "$locomo_end_sample") BATCH=$(shell_quote "$locomo_batch") RETRIEVE_K=$(shell_quote "$locomo_retrieve_k") PATCH_TOP_K=$(shell_quote "$locomo_patch_top_k") PATCH_USAGE=$(shell_quote "$locomo_patch_usage") TEMPERATURE_C5=$(shell_quote "$locomo_temperature_c5") RAW_LLM_LOG=$(shell_quote "$locomo_raw_llm_log") PATCH_CACHE_ROOT_BASE=$(shell_quote "$locomo_patch_cache_root_base") RESUME=$(shell_quote "$RESUME") bash scripts/run_locomo_baseline_patch_3models.sh $(shell_quote "$runner_method")"
+  local locomo_sample_ids="${SAMPLE_IDS:-$CONFIG_LOCOMO_SAMPLE_IDS}"
+  printf '%s' "cd $(shell_quote "$ROOT_DIR") && source $(shell_quote "$ROOT_DIR/$VENV_DIR/bin/activate") && BACKEND=$(shell_quote "$BACKEND") OPENAI_API_KEY=$(shell_quote "$API_KEY") OPENROUTER_API_KEY=$(shell_quote "$API_KEY") OPENAI_BASE_URL=$(shell_quote "$API_BASE") MODEL_LIST=$(shell_quote "$model") DATASET=$(shell_quote "$locomo_dataset") RATIO=$(shell_quote "$locomo_ratio") START_SAMPLE=$(shell_quote "$locomo_start_sample") END_SAMPLE=$(shell_quote "$locomo_end_sample") SAMPLE_IDS=$(shell_quote "$locomo_sample_ids") BATCH=$(shell_quote "$locomo_batch") RETRIEVE_K=$(shell_quote "$locomo_retrieve_k") PATCH_TOP_K=$(shell_quote "$locomo_patch_top_k") PATCH_USAGE=$(shell_quote "$locomo_patch_usage") TEMPERATURE_C5=$(shell_quote "$locomo_temperature_c5") RAW_LLM_LOG=$(shell_quote "$locomo_raw_llm_log") PATCH_CACHE_ROOT_BASE=$(shell_quote "$locomo_patch_cache_root_base") RESUME=$(shell_quote "$RESUME") bash scripts/run_locomo_baseline_patch_3models.sh $(shell_quote "$runner_method")"
 }
 
 build_persona_job_command() {
@@ -657,7 +660,7 @@ run_locomo() {
   local model_csv
   model_csv="$(join_by_comma "${LOCOMO_MODELS[@]}")"
   print_header "Running LoCoMo experiments"
-  BACKEND="$BACKEND"   OPENAI_API_KEY="$API_KEY"   OPENROUTER_API_KEY="$API_KEY"   OPENAI_BASE_URL="$API_BASE"   MODEL_LIST="$model_csv"   DATASET="${DATASET:-$CONFIG_LOCOMO_DATASET}"   RATIO="${RATIO:-$CONFIG_LOCOMO_RATIO}"   START_SAMPLE="${START_SAMPLE:-$CONFIG_LOCOMO_START_SAMPLE}"   END_SAMPLE="${END_SAMPLE:-$CONFIG_LOCOMO_END_SAMPLE}"   BATCH="${BATCH:-$CONFIG_LOCOMO_BATCH}"   RETRIEVE_K="${RETRIEVE_K:-$CONFIG_LOCOMO_RETRIEVE_K}"   PATCH_TOP_K="${PATCH_TOP_K:-$CONFIG_LOCOMO_PATCH_TOP_K}"   PATCH_USAGE="${PATCH_USAGE:-$CONFIG_LOCOMO_PATCH_USAGE}"   TEMPERATURE_C5="${TEMPERATURE_C5:-$CONFIG_LOCOMO_TEMPERATURE_C5}"   RAW_LLM_LOG="${RAW_LLM_LOG:-$CONFIG_LOCOMO_RAW_LLM_LOG}"   PATCH_CACHE_ROOT_BASE="${PATCH_CACHE_ROOT_BASE:-$CONFIG_LOCOMO_PATCH_CACHE_ROOT_BASE}"   RESUME="$RESUME"   bash scripts/run_locomo_baseline_patch_3models.sh "$METHOD"
+  BACKEND="$BACKEND"   OPENAI_API_KEY="$API_KEY"   OPENROUTER_API_KEY="$API_KEY"   OPENAI_BASE_URL="$API_BASE"   MODEL_LIST="$model_csv"   DATASET="${DATASET:-$CONFIG_LOCOMO_DATASET}"   RATIO="${RATIO:-$CONFIG_LOCOMO_RATIO}"   START_SAMPLE="${START_SAMPLE:-$CONFIG_LOCOMO_START_SAMPLE}"   END_SAMPLE="${END_SAMPLE:-$CONFIG_LOCOMO_END_SAMPLE}"   SAMPLE_IDS="${SAMPLE_IDS:-$CONFIG_LOCOMO_SAMPLE_IDS}"   BATCH="${BATCH:-$CONFIG_LOCOMO_BATCH}"   RETRIEVE_K="${RETRIEVE_K:-$CONFIG_LOCOMO_RETRIEVE_K}"   PATCH_TOP_K="${PATCH_TOP_K:-$CONFIG_LOCOMO_PATCH_TOP_K}"   PATCH_USAGE="${PATCH_USAGE:-$CONFIG_LOCOMO_PATCH_USAGE}"   TEMPERATURE_C5="${TEMPERATURE_C5:-$CONFIG_LOCOMO_TEMPERATURE_C5}"   RAW_LLM_LOG="${RAW_LLM_LOG:-$CONFIG_LOCOMO_RAW_LLM_LOG}"   PATCH_CACHE_ROOT_BASE="${PATCH_CACHE_ROOT_BASE:-$CONFIG_LOCOMO_PATCH_CACHE_ROOT_BASE}"   RESUME="$RESUME"   bash scripts/run_locomo_baseline_patch_3models.sh "$METHOD"
 }
 
 run_persona() {

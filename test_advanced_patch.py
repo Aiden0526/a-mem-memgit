@@ -235,6 +235,7 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
                      end_sample: int | None = None,
                      num_workers: int = 1,
                      worker_id: int = 0,
+                     sample_ids: list[int] | None = None,
                      skip_qa: bool = False,
                      api_key: str | None = None,
                      api_base: str | None = None,
@@ -251,7 +252,11 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
                      log_file: str | None = None):
     if log_file:
         logger.info("logging to %s", log_file)
-    samples = load_locomo_dataset(dataset_path)
+    samples = list(enumerate(load_locomo_dataset(dataset_path)))
+    if sample_ids:
+        sample_id_set = set(sample_ids)
+        samples = [sample_item for sample_item in samples if sample_item[0] in sample_id_set]
+        logger.info("Filtered to sample ids: %s (%d samples)", sorted(sample_id_set), len(samples))
     if ratio < 1.0:
         num_samples = max(1, int(len(samples) * ratio))
         samples = samples[:num_samples]
@@ -267,8 +272,8 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
     if worker_id < 0 or worker_id >= num_workers:
         raise ValueError("worker_id must satisfy 0 <= worker_id < num_workers")
     if num_workers > 1:
-        samples = [sample for sample_idx, sample in enumerate(samples)
-                   if sample_idx % num_workers == worker_id]
+        samples = [sample_item for position, sample_item in enumerate(samples)
+                   if position % num_workers == worker_id]
 
     local_host, local_port = resolve_local_backend_endpoint(
         backend,
@@ -292,28 +297,28 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
     )
     qa_results, sample_patch_summaries, category_counts, completed_result_keys = load_existing_patch_result(inventory_output)
     total_questions = len(qa_results)
-    total_qas_in_run = sum(len(sample.qa) for sample in samples) if not skip_qa else 0
+    total_qas_in_run = sum(len(sample.qa) for _, sample in samples) if not skip_qa else 0
 
     sample_progress = tqdm(samples, desc="Samples", unit="sample")
-    for sample_idx, sample in enumerate(sample_progress):
-        sample_progress.set_postfix_str(f"sample_id={sample.sample_id}")
+    for shard_idx, (sample_idx, sample) in enumerate(sample_progress):
+        sample_progress.set_postfix_str(f"sample_id={sample_idx}")
         agent.set_sample(sample.sample_id)
         if agent.memory_system.has_complete_global_graph_cache():
-            logger.info("sample=%s loaded complete global graph cache; skipping rebuild", sample.sample_id)
+            logger.info("sample=%s loaded complete global graph cache; skipping rebuild", sample_idx)
         else:
             turn_entries = flatten_locomo_sample_turns(sample)
             resume_turn_index = resolve_patch_resume_index(agent.memory_system, turn_entries)
             if resume_turn_index > 0:
                 logger.info(
                     "sample=%s resuming patch build from turn %s/%s",
-                    sample.sample_id,
+                    sample_idx,
                     resume_turn_index,
                     len(turn_entries),
                 )
             turn_progress = tqdm(
                 total=len(turn_entries),
                 initial=resume_turn_index,
-                desc=f"Build {sample.sample_id}",
+                desc=f"Build {sample_idx}",
                 unit="turn",
                 leave=False,
             )
@@ -343,7 +348,7 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
         sample_patch_summaries.append(patch_summary)
         logger.info(
             "patch_inventory sample=%s patches=%s types=%s avg_changed_nodes=%.2f max_changed_nodes=%s sessions=%s patch_dir=%s patch_files=%s",
-            sample.sample_id,
+            sample_idx,
             patch_summary["patch_count"],
             patch_summary["patch_type_counts"],
             patch_summary["avg_changed_nodes"],
@@ -366,7 +371,7 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
         if skip_qa:
             continue
 
-        qa_progress = tqdm(sample.qa, desc=f"QA {sample.sample_id}", unit="qa", leave=False)
+        qa_progress = tqdm(sample.qa, desc=f"QA {sample_idx}", unit="qa", leave=False)
         for qa_idx, qa in enumerate(qa_progress):
             qa_key = build_patch_result_key(sample.sample_id, qa_idx, int(qa.category), qa.question)
             if qa_key in completed_result_keys:
@@ -376,7 +381,7 @@ def evaluate_dataset(dataset_path: str, model: str, ratio: float = 1.0,
             qa_progress.set_postfix_str(f"global={total_questions}/{total_qas_in_run} cat={qa.category}")
             logger.info(
                 "qa_progress sample=%s qa=%s/%s sample_qa=%s/%s category=%s question=%s",
-                sample.sample_id,
+                sample_idx,
                 total_questions,
                 total_qas_in_run,
                 qa_idx + 1,
@@ -514,6 +519,8 @@ def run_batch_workers(args) -> dict:
 
     if args.end_sample is not None:
         child_base.extend(["--end_sample", str(args.end_sample)])
+    if args.sample_ids:
+        child_base.extend(["--sample-ids", args.sample_ids])
     if args.max_samples is not None:
         child_base.extend(["--max_samples", str(args.max_samples)])
     if args.skip_qa:
@@ -601,6 +608,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--worker_id", type=int, default=0)
     parser.add_argument("--batch", type=int, default=None)
+    parser.add_argument("--sample-ids", type=str, default=None,
+                        help="Comma-separated dataset sample ids to evaluate")
     parser.add_argument("--skip_qa", action="store_true")
     parser.add_argument("--api_key", type=str, default=None)
     parser.add_argument("--api_base", type=str, default=None,
@@ -629,6 +638,10 @@ if __name__ == "__main__":
             run_batch_workers(args)
             sys.exit(0)
 
+    sample_ids = None
+    if args.sample_ids:
+        sample_ids = [int(part.strip()) for part in args.sample_ids.split(",") if part.strip()]
+
     evaluate_dataset(
         dataset_path=args.dataset,
         model=args.model,
@@ -646,6 +659,7 @@ if __name__ == "__main__":
         end_sample=args.end_sample,
         num_workers=args.num_workers,
         worker_id=args.worker_id,
+        sample_ids=sample_ids,
         skip_qa=args.skip_qa,
         api_key=args.api_key,
         api_base=args.api_base,

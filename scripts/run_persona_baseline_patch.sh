@@ -333,6 +333,20 @@ sanitize() {
   echo "$value"
 }
 
+persona_selection_suffix() {
+  local suffix=""
+  if [[ -n "$PERSONA_IDS" ]]; then
+    local safe_ids="${PERSONA_IDS//,/ _}"
+    safe_ids="${safe_ids// /_}"
+    safe_ids="${safe_ids//[^A-Za-z0-9_]/_}"
+    safe_ids="${safe_ids//__/_}"
+    suffix="_personas_${safe_ids}"
+  elif [[ -n "$MAX_ITEMS" ]]; then
+    suffix="_maxitems_$(sanitize "$MAX_ITEMS")"
+  fi
+  printf '%s' "$suffix"
+}
+
 bool_enabled() {
   case "$1" in
     1|true|TRUE|yes|YES) return 0 ;;
@@ -448,6 +462,7 @@ if [[ "$RUN_TARGET" == "patch" || "$RUN_TARGET" == "both" ]]; then
 fi
 
 benchmark_tag="$(basename "$BENCHMARK_FILE" .csv)"
+selection_suffix="$(persona_selection_suffix)"
 
 for model in "${MODELS[@]}"; do
   safe_model="$(sanitize "$model")"
@@ -458,7 +473,7 @@ for model in "${MODELS[@]}"; do
   echo "Model: $model"
 
   if [[ "$RUN_TARGET" == "robust" || "$RUN_TARGET" == "both" ]]; then
-    robust_output="$OUTPUT_DIR/persona_robust_${safe_model}_${benchmark_tag}.csv"
+    robust_output="$OUTPUT_DIR/persona_robust_${safe_model}_${benchmark_tag}${selection_suffix}.csv"
     robust_cmd=(
       python test_persona_robust.py
       "${COMMON_ARGS[@]}"
@@ -470,7 +485,7 @@ for model in "${MODELS[@]}"; do
   fi
 
   if [[ "$RUN_TARGET" == "patch" || "$RUN_TARGET" == "both" ]]; then
-    patch_output="$OUTPUT_DIR/persona_patch_${safe_model}_${benchmark_tag}.csv"
+    patch_output="$OUTPUT_DIR/persona_patch_${safe_model}_${benchmark_tag}${selection_suffix}.csv"
     PATCH_ARGS=()
     set_patch_args
     patch_cmd=(

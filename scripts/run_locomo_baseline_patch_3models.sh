@@ -23,6 +23,7 @@ CONFIG_DATASET="data/locomo10.json"
 CONFIG_RATIO="1.0"
 CONFIG_START_SAMPLE="0"
 CONFIG_END_SAMPLE=""
+CONFIG_SAMPLE_IDS=""
 CONFIG_BATCH="9"
 CONFIG_RETRIEVE_K="10"
 CONFIG_PATCH_TOP_K="2"
@@ -56,6 +57,7 @@ Supported overrides:
   RATIO            Dataset ratio after load
   START_SAMPLE     Start index after ratio filtering
   END_SAMPLE       Optional exclusive end index
+  SAMPLE_IDS       Optional comma-separated dataset sample ids
   BATCH            Worker count
   RETRIEVE_K       Retrieval top-k for both runners
   PATCH_TOP_K      Patch retrieval top-k
@@ -91,6 +93,7 @@ DATASET="${DATASET:-$CONFIG_DATASET}"
 RATIO="${RATIO:-$CONFIG_RATIO}"
 START_SAMPLE="${START_SAMPLE:-$CONFIG_START_SAMPLE}"
 END_SAMPLE="${END_SAMPLE:-$CONFIG_END_SAMPLE}"
+SAMPLE_IDS="${SAMPLE_IDS:-$CONFIG_SAMPLE_IDS}"
 BATCH="${BATCH:-$CONFIG_BATCH}"
 RETRIEVE_K="${RETRIEVE_K:-$CONFIG_RETRIEVE_K}"
 PATCH_TOP_K="${PATCH_TOP_K:-$CONFIG_PATCH_TOP_K}"
@@ -167,17 +170,42 @@ set_common_args() {
   if [[ -n "$END_SAMPLE" ]]; then
     COMMON_ARGS+=(--end_sample "$END_SAMPLE")
   fi
+  if [[ -n "$SAMPLE_IDS" ]]; then
+    COMMON_ARGS+=(--sample-ids "$SAMPLE_IDS")
+  fi
 
   if [[ -n "$BATCH" ]]; then
     COMMON_ARGS+=(--batch "$BATCH")
   fi
 }
 
+selection_suffix() {
+  local suffix=""
+  if [[ -n "$SAMPLE_IDS" ]]; then
+    local safe_ids="${SAMPLE_IDS//,/ _}"
+    safe_ids="${safe_ids// /_}"
+    safe_ids="${safe_ids//[^A-Za-z0-9_]/_}"
+    safe_ids="${safe_ids//__/_}"
+    suffix="_samples_${safe_ids}"
+  elif [[ "$RATIO" != "1.0" || "$START_SAMPLE" != "0" || -n "$END_SAMPLE" ]]; then
+    local safe_ratio
+    safe_ratio="$(sanitize "$RATIO")"
+    local safe_start
+    safe_start="$(sanitize "$START_SAMPLE")"
+    local safe_end="end"
+    if [[ -n "$END_SAMPLE" ]]; then
+      safe_end="$(sanitize "$END_SAMPLE")"
+    fi
+    suffix="_ratio${safe_ratio}_range${safe_start}_${safe_end}"
+  fi
+  printf '%s' "$suffix"
+}
+
 print_resolved_config() {
   echo "Run target: $RUN_TARGET"
   echo "API base: $API_BASE"
   echo "Dataset: $DATASET"
-  echo "Ratio: $RATIO | start_sample: $START_SAMPLE | end_sample: ${END_SAMPLE:-NONE} | batch: $BATCH"
+  echo "Ratio: $RATIO | start_sample: $START_SAMPLE | end_sample: ${END_SAMPLE:-NONE} | sample_ids: ${SAMPLE_IDS:-ALL} | batch: $BATCH"
   echo "retrieve_k: $RETRIEVE_K | patch_top_k: $PATCH_TOP_K | patch_usage: $PATCH_USAGE | temperature_c5: $TEMPERATURE_C5"
   if [[ -n "$RAW_LLM_LOG" ]]; then
     echo "raw_llm_log: $RAW_LLM_LOG"
@@ -191,6 +219,7 @@ print_resolved_config
 for model in "${MODELS[@]}"; do
   patch_cache_root=""
   safe_model="$(sanitize "$model")"
+  output_suffix="$(selection_suffix)"
   COMMON_ARGS=()
   set_common_args "$model"
   if [[ -n "$PATCH_CACHE_ROOT_BASE" ]]; then
@@ -202,7 +231,7 @@ for model in "${MODELS[@]}"; do
   echo "Model: $model"
 
   if [[ "$RUN_TARGET" == "robust" || "$RUN_TARGET" == "both" ]]; then
-    robust_output="robust_results/locomo_robust_${safe_model}.json"
+    robust_output="robust_results/locomo_robust_${safe_model}${output_suffix}.json"
     robust_cmd=(
       python test_advanced_robust.py
       "${COMMON_ARGS[@]}"
@@ -218,7 +247,7 @@ for model in "${MODELS[@]}"; do
   fi
 
   if [[ "$RUN_TARGET" == "patch" || "$RUN_TARGET" == "both" ]]; then
-    patch_output="patch_results/locomo_patch_${safe_model}.json"
+    patch_output="patch_results/locomo_patch_${safe_model}${output_suffix}.json"
     patch_cmd=(
       python test_advanced_patch.py
       "${COMMON_ARGS[@]}"
