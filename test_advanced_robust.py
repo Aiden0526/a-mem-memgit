@@ -24,7 +24,6 @@ import numpy as np
 from load_dataset import load_locomo_dataset, QA, Turn, Session, Conversation
 import nltk
 from sentence_transformers import SentenceTransformer
-from memory_layer import preferred_sentence_transformer_device
 from sentence_transformers.util import pytorch_cos_sim
 import statistics
 from collections import defaultdict
@@ -46,7 +45,7 @@ except LookupError:
 
 # Initialize SentenceTransformer model (this will be reused)
 try:
-    sentence_model = SentenceTransformer('all-MiniLM-L6-v2', device=preferred_sentence_transformer_device())
+    sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
 except Exception as e:
     print(f"Warning: Could not load SentenceTransformer model: {e}")
     sentence_model = None
@@ -533,7 +532,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
         eval_logger.info(f"Category {category}: {count} questions ({count/total_questions*100:.1f}%)")
 
     eval_logger.info("Aggregate Metrics:")
-    for split_name, metrics in aggregate_results.items():
+    for split_name, metrics in final_results.get("aggregate_metrics", {}).items():
         eval_logger.info(f"{split_name.replace('_', ' ').title()}:")
         for metric_name, stats in metrics.items():
             eval_logger.info(f"  {metric_name}:")
