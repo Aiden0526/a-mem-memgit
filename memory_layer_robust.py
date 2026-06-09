@@ -11,6 +11,8 @@ Key differences from the original:
 """
 
 from typing import List, Dict, Optional, Literal, Any
+from contextlib import contextmanager
+import contextvars
 import json
 import re
 import uuid
@@ -42,6 +44,219 @@ from llm_text_parsers import (
 
 logger = logging.getLogger("amem_robust")
 raw_logger = logging.getLogger("amem_robust_raw")
+_usage_stage_var: contextvars.ContextVar[str] = contextvars.ContextVar("amem_llm_usage_stage", default="unknown")
+_usage_recorder_var: contextvars.ContextVar[Optional["LLMUsageRecorder"]] = contextvars.ContextVar(
+    "amem_llm_usage_recorder", default=None
+)
+
+
+def _jsonable(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if hasattr(value, "model_dump"):
+        return _jsonable(value.model_dump())
+    if hasattr(value, "dict"):
+        return _jsonable(value.dict())
+    if hasattr(value, "__dict__"):
+        return _jsonable(vars(value))
+    return str(value)
+
+
+def _deep_get(mapping: Any, path: List[str], default: Any = None) -> Any:
+    current = mapping
+    for key in path:
+        if isinstance(current, dict):
+            current = current.get(key)
+        else:
+            current = getattr(current, key, None)
+        if current is None:
+            return default
+    return current
+
+
+def _number(value: Any) -> float:
+    if value is None:
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _env_enabled(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _openrouter_cache_control() -> Dict[str, str]:
+    cache_control = {"type": "ephemeral"}
+    ttl = os.getenv("OPENROUTER_PROMPT_CACHE_TTL", "").strip()
+    if ttl:
+        cache_control["ttl"] = ttl
+    return cache_control
+
+
+def _openrouter_prompt_cache_enabled(model: str) -> bool:
+    return model.startswith("openrouter/") and _env_enabled("OPENROUTER_PROMPT_CACHE")
+
+
+def is_nonrecoverable_llm_error(exc: BaseException) -> bool:
+    """Return True for configuration/auth errors that should stop a run."""
+    text = f"{exc.__class__.__module__}.{exc.__class__.__name__}: {exc}"
+    markers = (
+        "AuthenticationError",
+        "Unauthorized",
+        "User not found",
+        '"code":401',
+        "code': 401",
+        "LLM Provider NOT provided",
+        "BadRequestError",
+        "Provider List:",
+        '"code":403',
+        "code': 403",
+        "Key limit exceeded",
+        "total limit",
+    )
+    return any(marker in text for marker in markers)
+
+
+class LLMUsageRecorder:
+    """Append-only per-call token usage recorder for provider-reported usage."""
+
+    def __init__(self, path: str | os.PathLike[str], metadata: Optional[Dict[str, Any]] = None):
+        self.path = os.fspath(path)
+        self.metadata = metadata or {}
+        self.records: List[Dict[str, Any]] = []
+        self.totals: Dict[str, Dict[str, float]] = {}
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+
+    def _bucket(self, name: str) -> Dict[str, float]:
+        if name not in self.totals:
+            self.totals[name] = {
+                "calls": 0.0,
+                "agent_steps": 0.0,
+                "prompt_tokens": 0.0,
+                "completion_tokens": 0.0,
+                "total_tokens": 0.0,
+                "reasoning_tokens": 0.0,
+                "cached_tokens": 0.0,
+                "cache_write_tokens": 0.0,
+                "response_cost": 0.0,
+            }
+        return self.totals[name]
+
+    def record(self, entry: Dict[str, Any]) -> None:
+        usage = entry.get("usage") or {}
+        stage = str(entry.get("stage") or "unknown")
+        stage_group = stage.split(".", 1)[0]
+        prompt_tokens = _number(usage.get("prompt_tokens") or usage.get("input_tokens"))
+        completion_tokens = _number(usage.get("completion_tokens") or usage.get("output_tokens"))
+        total_tokens = _number(usage.get("total_tokens")) or prompt_tokens + completion_tokens
+        reasoning_tokens = _number(
+            _deep_get(usage, ["completion_tokens_details", "reasoning_tokens"])
+            or _deep_get(usage, ["output_tokens_details", "reasoning_tokens"])
+            or usage.get("reasoning_tokens")
+        )
+        cached_tokens = _number(
+            _deep_get(usage, ["prompt_tokens_details", "cached_tokens"])
+            or _deep_get(usage, ["input_tokens_details", "cached_tokens"])
+            or usage.get("cached_tokens")
+        )
+        cache_write_tokens = _number(
+            _deep_get(usage, ["prompt_tokens_details", "cache_write_tokens"])
+            or _deep_get(usage, ["input_tokens_details", "cache_write_tokens"])
+            or usage.get("cache_write_tokens")
+        )
+        response_cost = _number(entry.get("response_cost"))
+
+        for bucket_name in ("all", stage_group, stage):
+            bucket = self._bucket(bucket_name)
+            bucket["calls"] += 1
+            bucket["agent_steps"] += 1
+            bucket["prompt_tokens"] += prompt_tokens
+            bucket["completion_tokens"] += completion_tokens
+            bucket["total_tokens"] += total_tokens
+            bucket["reasoning_tokens"] += reasoning_tokens
+            bucket["cached_tokens"] += cached_tokens
+            bucket["cache_write_tokens"] += cache_write_tokens
+            bucket["response_cost"] += response_cost
+
+        json_entry = _jsonable(entry)
+        self.records.append(json_entry)
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(json_entry, ensure_ascii=False) + "\n")
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "metadata": self.metadata,
+            "usage_log": self.path,
+            "totals": self.totals,
+        }
+
+
+@contextmanager
+def llm_usage_recorder(recorder: Optional[LLMUsageRecorder]):
+    token = _usage_recorder_var.set(recorder)
+    try:
+        yield recorder
+    finally:
+        _usage_recorder_var.reset(token)
+
+
+@contextmanager
+def llm_usage_stage(stage: str):
+    token = _usage_stage_var.set(stage)
+    try:
+        yield
+    finally:
+        _usage_stage_var.reset(token)
+
+
+def _extract_response_cost(response: Any) -> Optional[float]:
+    hidden_params = getattr(response, "_hidden_params", None)
+    if hidden_params is None and isinstance(response, dict):
+        hidden_params = response.get("_hidden_params")
+    cost = _deep_get(hidden_params, ["response_cost"])
+    if cost is None:
+        cost = _deep_get(hidden_params, ["additional_headers", "llm_provider-x-litellm-response-cost"])
+    try:
+        return float(cost) if cost is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def record_llm_response_usage(
+    *,
+    model: str,
+    prompt: str,
+    temperature: float,
+    max_tokens: Optional[int],
+    response: Any,
+    elapsed: float,
+    response_chars: int,
+) -> None:
+    recorder = _usage_recorder_var.get()
+    if recorder is None:
+        return
+
+    usage = _jsonable(getattr(response, "usage", None) or (response.get("usage") if isinstance(response, dict) else None) or {})
+    entry = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "stage": _usage_stage_var.get(),
+        "model": model,
+        "prompt_chars": len(prompt),
+        "prompt_md5": hashlib.md5(prompt.encode("utf-8")).hexdigest(),
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "elapsed_seconds": round(elapsed, 4),
+        "response_chars": response_chars,
+        "usage": usage,
+        "response_cost": _extract_response_cost(response),
+    }
+    recorder.record(entry)
 
 
 def require_text_completion_content(response, model: str) -> str:
@@ -113,6 +328,9 @@ def retry_llm_call(max_retries: int = 2, base_delay: float = 1.0):
                 try:
                     return func(*args, **kwargs)
                 except Exception as e:
+                    if is_nonrecoverable_llm_error(e):
+                        logger.error("LLM call %s failed with non-recoverable error: %s", func.__name__, e)
+                        raise
                     last_exc = e
                     if attempt < max_retries:
                         delay = base_delay * (2 ** attempt)
@@ -222,6 +440,15 @@ class RobustOpenAIController(RobustBaseLLMController):
         )
         elapsed = time.time() - start_time
         content = require_text_completion_content(response, self.model)
+        record_llm_response_usage(
+            model=self.model,
+            prompt=prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response=response,
+            elapsed=elapsed,
+            response_chars=len(content or ""),
+        )
         logger.info(
             "LLM request done model=%s digest=%s elapsed=%.2fs response_chars=%d",
             self.model, prompt_digest, elapsed, len(content or ""),
@@ -353,9 +580,23 @@ class RobustLiteLLMController(RobustBaseLLMController):
             completion_args["api_base"] = self.api_base
         if self.api_key:
             completion_args["api_key"] = self.api_key
+        if _openrouter_prompt_cache_enabled(self.model):
+            completion_args["cache_control"] = _openrouter_cache_control()
 
+        start_time = time.time()
         response = self._completion(**completion_args)
-        return require_text_completion_content(response, self.model)
+        elapsed = time.time() - start_time
+        content = require_text_completion_content(response, self.model)
+        record_llm_response_usage(
+            model=self.model,
+            prompt=prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response=response,
+            elapsed=elapsed,
+            response_chars=len(content or ""),
+        )
+        return content
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +740,8 @@ class RobustMemoryNote:
             return analysis
 
         except Exception as e:
+            if is_nonrecoverable_llm_error(e):
+                raise
             logger.error("Error analyzing content: %s", e)
             # Graceful degradation: heuristic keywords/context
             from llm_text_parsers import _heuristic_keywords, _heuristic_context
@@ -751,6 +994,8 @@ class RobustAgenticMemorySystem:
             return True, note
 
         except Exception as e:
+            if is_nonrecoverable_llm_error(e):
+                raise
             logger.error("Evolution failed for note %s: %s — storing without evolution", note.id, e)
             return False, note
 
@@ -843,6 +1088,8 @@ class RobustAgenticMemorySystem:
             return True, note, trace
 
         except Exception as e:
+            if is_nonrecoverable_llm_error(e):
+                raise
             logger.error("Evolution failed for note %s: %s — storing without evolution", note.id, e)
             trace["error"] = str(e)
             return False, note, trace

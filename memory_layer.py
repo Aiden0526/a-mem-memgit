@@ -20,8 +20,55 @@ import requests
 import json as json_lib
 import time
 
-
 logger = logging.getLogger("memory_layer")
+
+
+def normalize_litellm_model_name(backend: str, model: str) -> str:
+    """Normalize provider-qualified model names for LiteLLM backends."""
+    normalized = model.strip()
+    if backend == "openrouter" and normalized and not normalized.startswith("openrouter/"):
+        return f"openrouter/{normalized}"
+    return normalized
+
+
+def is_openrouter_api_base(api_base: Optional[str]) -> bool:
+    return bool(api_base and "openrouter.ai" in api_base.lower())
+
+
+def is_nonrecoverable_litellm_error(exc: BaseException) -> bool:
+    text = f"{exc.__class__.__module__}.{exc.__class__.__name__}: {exc}"
+    markers = (
+        "AuthenticationError",
+        "Unauthorized",
+        "User not found",
+        '"code":401',
+        "code': 401",
+        "LLM Provider NOT provided",
+        "BadRequestError",
+        "Provider List:",
+        '"code":403',
+        "code': 403",
+        "Key limit exceeded",
+        "total limit",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _env_enabled(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _openrouter_cache_control() -> Dict[str, str]:
+    cache_control = {"type": "ephemeral"}
+    ttl = os.getenv("OPENROUTER_PROMPT_CACHE_TTL", "").strip()
+    if ttl:
+        cache_control["ttl"] = ttl
+    return cache_control
+
+
+def _openrouter_prompt_cache_enabled(model: str) -> bool:
+    return model.startswith("openrouter/") and _env_enabled("OPENROUTER_PROMPT_CACHE")
+
 
 def preferred_sentence_transformer_device() -> str:
     try:
@@ -39,6 +86,7 @@ def build_sentence_transformer(model_name: str) -> SentenceTransformer:
     device = preferred_sentence_transformer_device()
     logger.info("Loading SentenceTransformer model %s on device=%s", model_name, device)
     return SentenceTransformer(model_name, device=device)
+
 
 def simple_tokenize(text):
     try:
@@ -200,8 +248,15 @@ class SGLangController(BaseLLMController):
 
 class LiteLLMController(BaseLLMController):
     """LiteLLM controller for universal LLM access including Ollama and SGLang"""
-    def __init__(self, model: str, api_base: Optional[str] = None, api_key: Optional[str] = None):
-        self.model = model
+    def __init__(
+        self,
+        model: str,
+        api_base: Optional[str] = None,
+        api_key: Optional[str] = None,
+        backend: str = "",
+    ):
+        inferred_backend = backend or ("openrouter" if is_openrouter_api_base(api_base) else "")
+        self.model = normalize_litellm_model_name(inferred_backend, model)
         self.api_base = api_base
         self.api_key = api_key or "EMPTY"
     
@@ -250,11 +305,15 @@ class LiteLLMController(BaseLLMController):
                 completion_args["api_base"] = self.api_base
             if self.api_key:
                 completion_args["api_key"] = self.api_key
+            if _openrouter_prompt_cache_enabled(self.model):
+                completion_args["cache_control"] = _openrouter_cache_control()
                 
             response = completion(**completion_args)
             return response.choices[0].message.content
             
         except Exception as e:
+            if is_nonrecoverable_litellm_error(e):
+                raise
             print(f"LiteLLM completion error: {e}")
             empty_response = self._generate_empty_response(response_format)
             return json.dumps(empty_response)
@@ -262,7 +321,7 @@ class LiteLLMController(BaseLLMController):
 class LLMController:
     """LLM-based controller for memory metadata generation"""
     def __init__(self, 
-                 backend: Literal["openai", "ollama", "sglang"] = "sglang",
+                 backend: Literal["openai", "openrouter", "ollama", "sglang"] = "sglang",
                  model: str = "gpt-4", 
                  api_key: Optional[str] = None,
                  api_base: Optional[str] = None,
@@ -276,13 +335,21 @@ class LLMController:
             self.llm = LiteLLMController(
                 model=ollama_model, 
                 api_base="http://localhost:11434", 
-                api_key="EMPTY"
+                api_key="EMPTY",
+                backend="ollama",
+            )
+        elif backend == "openrouter":
+            self.llm = LiteLLMController(
+                model=normalize_litellm_model_name("openrouter", model),
+                api_base=api_base or "https://openrouter.ai/api/v1",
+                api_key=api_key or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY") or "EMPTY",
+                backend="openrouter",
             )
         elif backend == "sglang":
             # Direct SGLang API calls (better performance, no proxy)
             self.llm = SGLangController(model, sglang_host, sglang_port)
         else:
-            raise ValueError("Backend must be 'openai', 'ollama', or 'sglang'")
+            raise ValueError("Backend must be 'openai', 'openrouter', 'ollama', or 'sglang'")
 
 class MemoryNote:
     """Basic memory unit with metadata"""
@@ -417,6 +484,8 @@ class MemoryNote:
             return analysis
             
         except Exception as e:
+            if is_nonrecoverable_litellm_error(e):
+                raise
             print(f"Error analyzing content: {str(e)}")
             print(f"Raw response: {response}")
             return {

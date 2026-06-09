@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover - optional runtime dependency
     BM25Okapi = None
 
 from memory_layer import SimpleEmbeddingRetriever, simple_tokenize
-from memory_layer_robust import RobustAgenticMemorySystem, RobustLLMController
+from memory_layer_robust import RobustAgenticMemorySystem, RobustLLMController, is_nonrecoverable_llm_error
 from patch_prompts import (
     PATCH_CONTEXT_INSTRUCTION,
     PATCH_CONTEXT_PREF_INSTRUCTION,
@@ -199,6 +199,11 @@ class PatchAugmentedMemorySystem:
 
     def get_resume_turn_index(self) -> int:
         status = self.get_build_status()
+        if status.get("fatal_error") and status.get("resume_turn_index") is not None:
+            try:
+                return max(0, int(status.get("resume_turn_index")))
+            except (TypeError, ValueError):
+                pass
         last_turn_number = status.get("last_turn_number")
         if last_turn_number is not None:
             try:
@@ -246,6 +251,32 @@ class PatchAugmentedMemorySystem:
             complete=True,
         )
         self.loaded_from_complete_cache = True
+
+    def mark_sample_failed(
+        self,
+        *,
+        turn_position: Optional[int],
+        turn_number: Optional[int],
+        exc: BaseException,
+    ) -> None:
+        # Do not save the in-memory graph here; it may have been partially mutated
+        # by the failing LLM call. Keep the previous cache as the clean resume point.
+        status = self.store.load_build_status(self.sample_id) or {}
+        status.update(
+            {
+                'sample_id': self.sample_id,
+                'global_graph_complete': False,
+                'fatal_error': True,
+                'fatal_error_stage': 'memory_build',
+                'failed_turn_position': turn_position,
+                'failed_turn_number': turn_number,
+                'resume_turn_index': self.get_resume_turn_index(),
+                'fatal_error_type': f"{exc.__class__.__module__}.{exc.__class__.__name__}",
+                'fatal_error_message': str(exc),
+                'updated_at': datetime.utcnow().isoformat() + 'Z',
+            }
+        )
+        self.store.save_build_status(self.sample_id, status)
 
     def _load_or_build_patch_retriever(self) -> None:
         index_records = self.store.load_patch_index_records(self.sample_id)
@@ -795,6 +826,8 @@ class PatchAugmentedMemorySystem:
         try:
             raw = self.base_system.llm.get_completion(prompt, temperature=0.0)
         except Exception as exc:
+            if is_nonrecoverable_llm_error(exc):
+                raise
             logger.warning("llm_patch_filter_error %s — keeping all candidates", exc)
             return candidate_records
 

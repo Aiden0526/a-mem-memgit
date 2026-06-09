@@ -42,7 +42,7 @@ class FakeAgentManager:
         self.agent = FakeAgent()
         FakeAgentManager.last_instance = self
 
-    def get_agent(self, chat_history_path):
+    def get_agent(self, chat_history_path, persona_id=""):
         return self.agent
 
 
@@ -63,6 +63,57 @@ class PersonaRobustLogicTests(unittest.TestCase):
             row = {"chat_history_32k_link": "data/chat_history_32k/sample.json"}
             resolved = persona.resolve_chat_history_path(row, size="32k", persona_root=root)
             self.assertEqual(resolved, chat.resolve())
+
+    def test_compute_metrics_lines_prefers_explicit_chain_id(self):
+        rows = [
+            {
+                "persona_id": "0",
+                "preference": "Different text A",
+                "chain_id": "chain_shared",
+                "is_correct_mcq_32k": "True",
+            },
+            {
+                "persona_id": "0",
+                "preference": "Different text B",
+                "chain_id": "chain_shared",
+                "is_correct_mcq_32k": "False",
+            },
+        ]
+
+        metrics_text = "\n".join(persona.compute_metrics_lines(rows, "32k"))
+
+        self.assertIn("Overall: 1/2 = 0.500", metrics_text)
+        self.assertIn("Overall chain acc: 0/1 = 0.000", metrics_text)
+        self.assertIn("Chain size distribution: 2q:1", metrics_text)
+
+    def test_compute_metrics_lines_includes_posthoc_chain_exact_match(self):
+        rows = [
+            {
+                "persona_id": "0",
+                "preference": "Likes tea.; Now prefers green tea.",
+                "is_correct_mcq_32k": "True",
+                "ood_type": "temporal_trajectory",
+            },
+            {
+                "persona_id": "0",
+                "preference": "Likes tea.; Now prefers green tea.",
+                "is_correct_mcq_32k": "False",
+                "ood_type": "temporal_trajectory",
+            },
+            {
+                "persona_id": "0",
+                "preference": "Likes quiet cafes.",
+                "is_correct_mcq_32k": "True",
+                "ood_type": "single_pattern_transfer",
+            },
+        ]
+
+        metrics_text = "\n".join(persona.compute_metrics_lines(rows, "32k"))
+
+        self.assertIn("Overall: 2/3 = 0.667", metrics_text)
+        self.assertIn("Overall chain acc: 1/2 = 0.500", metrics_text)
+        self.assertIn("Temporal-trajectory chains: 0/1 = 0.000", metrics_text)
+        self.assertIn("Chain size distribution: 1q:1, 2q:1", metrics_text)
 
     def test_evaluate_persona_benchmark_writes_persona_shaped_outputs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -115,6 +166,7 @@ class PersonaRobustLogicTests(unittest.TestCase):
                     answer_temperature=0.0,
                     sglang_host="http://localhost",
                     sglang_port=30000,
+                    api_base=None,
                     include_system_messages=True,
                     max_live_agents=1,
                     num_workers=1,

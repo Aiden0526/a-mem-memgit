@@ -28,6 +28,7 @@ import random
 import re
 import subprocess
 import sys
+import time
 from collections import OrderedDict, defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -36,7 +37,14 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from tqdm import tqdm
 
 from llm_text_parsers import parse_keywords_response
-from memory_layer_robust import RobustAgenticMemorySystem, RobustLLMController
+from memory_layer_robust import (
+    LLMUsageRecorder,
+    RobustAgenticMemorySystem,
+    RobustLLMController,
+    is_nonrecoverable_llm_error,
+    llm_usage_recorder,
+    llm_usage_stage,
+)
 
 
 logger = logging.getLogger("persona_robust")
@@ -274,8 +282,12 @@ def serialize_chat_message(message: Dict[str, Any], index: int) -> str:
     return f"[{index:04d}] {role}: {content}"
 
 
-def build_cache_key(chat_history_path: Path, include_system_messages: bool) -> str:
-    payload = f"{chat_history_path.resolve()}|include_system={include_system_messages}"
+def build_cache_key(chat_history_path: Path, include_system_messages: bool, persona_id: str = "") -> str:
+    payload = (
+        f"{chat_history_path.resolve()}|"
+        f"include_system={include_system_messages}|"
+        f"persona_id={persona_id}"
+    )
     return hashlib.md5(payload.encode("utf-8")).hexdigest()
 
 
@@ -292,6 +304,28 @@ def load_build_status(path: Path) -> Dict[str, Any]:
         return {}
 
 
+def write_persona_build_status(
+    status_path: Path,
+    cache_key: str,
+    next_message_index: int,
+    total_messages: int,
+    complete: bool,
+    **extra_status: Any,
+) -> None:
+    status = {
+        "cache_key": cache_key,
+        "next_message_index": next_message_index,
+        "total_messages": total_messages,
+        "complete": complete,
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    }
+    status.update(extra_status)
+    status_path.write_text(
+        json.dumps(status, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 def save_persona_build_checkpoint(
     agent: "PersonaRobustAgent",
     memory_cache_file: Path,
@@ -304,19 +338,36 @@ def save_persona_build_checkpoint(
     complete: bool,
 ) -> None:
     agent.save_cached_state(memory_cache_file, retriever_cache_file, retriever_cache_embeddings_file)
-    status_path.write_text(
-        json.dumps(
-            {
-                "cache_key": cache_key,
-                "next_message_index": next_message_index,
-                "total_messages": total_messages,
-                "complete": complete,
-                "updated_at": datetime.utcnow().isoformat() + "Z",
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
+    write_persona_build_status(
+        status_path,
+        cache_key,
+        next_message_index,
+        total_messages,
+        complete,
+    )
+
+
+def mark_persona_build_failed(
+    status_path: Path,
+    cache_key: str,
+    failed_message_index: int,
+    total_messages: int,
+    exc: BaseException,
+) -> None:
+    # Do not save the in-memory agent here; it may have been partially mutated
+    # by the failing LLM call. The previous cache remains the clean resume point.
+    write_persona_build_status(
+        status_path,
+        cache_key,
+        failed_message_index,
+        total_messages,
+        False,
+        fatal_error=True,
+        fatal_error_stage="memory_build",
+        failed_message_index=failed_message_index,
+        resume_message_index=failed_message_index,
+        fatal_error_type=f"{exc.__class__.__module__}.{exc.__class__.__name__}",
+        fatal_error_message=str(exc),
     )
 
 
@@ -524,22 +575,22 @@ class AgentManager:
             preference_aware_level=self.preference_aware_level,
         )
 
-    def _cache_paths(self, chat_history_path: Path) -> Tuple[Path, Path, Path]:
-        cache_key = build_cache_key(chat_history_path, self.include_system_messages)
+    def _cache_paths(self, chat_history_path: Path, persona_id: str) -> Tuple[Path, Path, Path]:
+        cache_key = build_cache_key(chat_history_path, self.include_system_messages, persona_id)
         memory_cache = self.cache_dir / f"memory_cache_{cache_key}.pkl"
         retriever_cache = self.cache_dir / f"retriever_cache_{cache_key}.pkl"
         retriever_embeddings = self.cache_dir / f"retriever_cache_embeddings_{cache_key}.npy"
         return memory_cache, retriever_cache, retriever_embeddings
 
-    def get_agent(self, chat_history_path: Path) -> PersonaRobustAgent:
-        cache_key = build_cache_key(chat_history_path, self.include_system_messages)
+    def get_agent(self, chat_history_path: Path, persona_id: str) -> PersonaRobustAgent:
+        cache_key = build_cache_key(chat_history_path, self.include_system_messages, persona_id)
         if cache_key in self.agent_cache:
             agent = self.agent_cache.pop(cache_key)
             self.agent_cache[cache_key] = agent
             return agent
 
         agent = self._new_agent()
-        memory_cache, retriever_cache, retriever_embeddings = self._cache_paths(chat_history_path)
+        memory_cache, retriever_cache, retriever_embeddings = self._cache_paths(chat_history_path, persona_id)
         status_path = build_status_path(self.cache_dir, cache_key)
         build_status = load_build_status(status_path)
 
@@ -626,6 +677,43 @@ def resolve_chat_history_path(row: Dict[str, str], size: str, persona_root: Path
     return candidate.resolve()
 
 
+def normalize_chain_value(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def build_persona_chain_key(row: Dict[str, str]) -> Tuple[str, ...]:
+    """Build a post-hoc preference trajectory key from available benchmark metadata."""
+    chain_id = normalize_chain_value(row.get("chain_id", ""))
+    if chain_id:
+        return ("chain_id", chain_id)
+
+    persona_id = normalize_chain_value(row.get("persona_id", ""))
+    for trajectory_col in ("trajectory_id", "full_trajectory", "preference_trajectory"):
+        trajectory = normalize_chain_value(row.get(trajectory_col, ""))
+        if trajectory:
+            dimension = normalize_chain_value(
+                row.get("preference_dimension", "")
+                or row.get("preference_id", "")
+                or row.get("topic_label", "")
+                or row.get("topic_preference", "")
+            )
+            return ("trajectory", persona_id, dimension, trajectory)
+
+    preference = normalize_chain_value(row.get("preference", ""))
+    if preference:
+        return ("preference", persona_id, preference)
+
+    topic = normalize_chain_value(
+        row.get("preference_dimension", "")
+        or row.get("preference_id", "")
+        or row.get("topic_label", "")
+        or row.get("topic_preference", "")
+        or row.get("topic_query", "")
+    )
+    change_family = normalize_chain_value(row.get("change_family", ""))
+    return ("fallback", persona_id, topic, change_family)
+
+
 def compute_metrics_lines(rows: List[Dict[str, str]], size: str) -> List[str]:
     col = f"is_correct_mcq_{size}"
     lines: List[str] = []
@@ -634,16 +722,96 @@ def compute_metrics_lines(rows: List[Dict[str, str]], size: str) -> List[str]:
     correct = sum(1 for row in rows if row.get(col) == "True")
     lines.append(f"Overall: {correct}/{total} = {correct/total:.3f}" if total else "No data")
 
+    processed_rows = [row for row in rows if row.get(col) in ("True", "False")]
+
     def collect_by(key_fn):
         stats = defaultdict(lambda: {"c": 0, "t": 0})
-        for row in rows:
-            if row.get(col) not in ("True", "False"):
-                continue
+        for row in processed_rows:
             key = key_fn(row)
             stats[key]["t"] += 1
             if row[col] == "True":
                 stats[key]["c"] += 1
         return stats
+
+    def collect_chains_by_key(chain_rows: List[Dict[str, str]], key_fn):
+        chains = defaultdict(list)
+        for row in chain_rows:
+            chains[key_fn(row)].append(row)
+        passed = sum(1 for rows_for_chain in chains.values() if all(row[col] == "True" for row in rows_for_chain))
+        return chains, passed
+
+    def collect_chains(chain_rows: List[Dict[str, str]]):
+        return collect_chains_by_key(chain_rows, build_persona_chain_key)
+
+    def question_type_key(row: Dict[str, str]) -> str:
+        return normalize_chain_value(row.get("ood_type", "") or row.get("topic_query", ""))
+
+    if processed_rows:
+        chains, chain_passed = collect_chains(processed_rows)
+        chain_total = len(chains)
+        chain_sizes = defaultdict(int)
+        for rows_for_chain in chains.values():
+            chain_sizes[len(rows_for_chain)] += 1
+        size_text = ", ".join(f"{size}q:{count}" for size, count in sorted(chain_sizes.items()))
+        lines.append("\nPost-hoc Chain Exact Match:")
+        lines.append(
+            f"  Overall chain acc: {chain_passed}/{chain_total} = {chain_passed/chain_total:.3f}"
+        )
+        lines.append(
+            "  Chain definition: persona_id + explicit trajectory/full_trajectory when present; "
+            "else persona_id + preference text; else persona/topic/change_family fallback"
+        )
+        lines.append(f"  Chain size distribution: {size_text}")
+
+        temporal_rows = [
+            row for row in processed_rows
+            if normalize_chain_value(row.get("ood_type", "")) == "temporal_trajectory"
+            or normalize_chain_value(row.get("topic_query", "")) == "ood_temporal_trajectory"
+        ]
+        if temporal_rows:
+            temporal_chains, temporal_passed = collect_chains(temporal_rows)
+            temporal_total = len(temporal_chains)
+            lines.append(
+                f"  Temporal-trajectory chains: {temporal_passed}/{temporal_total} = {temporal_passed/temporal_total:.3f}"
+            )
+
+        lines.append("\nAlternative bucket exact-match metrics:")
+        alt_chain_specs = [
+            (
+                "persona",
+                lambda row: (normalize_chain_value(row.get("persona_id", "")),),
+            ),
+            (
+                "persona x question_type",
+                lambda row: (normalize_chain_value(row.get("persona_id", "")), question_type_key(row)),
+            ),
+            (
+                "persona x question_type x difficulty",
+                lambda row: (
+                    normalize_chain_value(row.get("persona_id", "")),
+                    question_type_key(row),
+                    normalize_chain_value(row.get("ood_difficulty", "")),
+                ),
+            ),
+            (
+                "persona x question_type x preference",
+                lambda row: (
+                    normalize_chain_value(row.get("persona_id", "")),
+                    question_type_key(row),
+                    normalize_chain_value(row.get("preference", "")),
+                ),
+            ),
+        ]
+        for label, key_fn in alt_chain_specs:
+            alt_chains, alt_passed = collect_chains_by_key(processed_rows, key_fn)
+            alt_total = len(alt_chains)
+            alt_sizes = defaultdict(int)
+            for rows_for_chain in alt_chains.values():
+                alt_sizes[len(rows_for_chain)] += 1
+            alt_size_text = ", ".join(f"{size}q:{count}" for size, count in sorted(alt_sizes.items()))
+            lines.append(
+                f"  {label}: {alt_passed}/{alt_total} = {alt_passed/alt_total:.3f} (sizes: {alt_size_text})"
+            )
 
     by_k = collect_by(lambda row: row.get("change_k", ""))
     lines.append("\nBy k:")
@@ -714,6 +882,15 @@ def write_metrics_file(results_csv_path: Path, rows: List[Dict[str, str]], size:
     metrics_lines = compute_metrics_lines(rows, size)
     metrics_path.write_text("\n".join(metrics_lines) + "\n", encoding="utf-8")
     return metrics_path
+
+
+def write_usage_summary_file(results_csv_path: Path, usage_recorder: LLMUsageRecorder) -> Path:
+    usage_summary_path = results_csv_path.with_name(f"{results_csv_path.stem}_llm_usage_summary.json")
+    usage_summary_path.write_text(
+        json.dumps(usage_recorder.summary(), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return usage_summary_path
 
 
 def build_output_path(
@@ -867,6 +1044,23 @@ def evaluate_persona_benchmark(
     correct = sum(1 for row in written_rows if row.get(f"is_correct_mcq_{size}") == "True")
     processed = resume_row_index
     mcq_processed = sum(1 for row in written_rows if row.get(f"is_correct_mcq_{size}") in ("True", "False"))
+    usage_log_path = output_path.with_name(f"{output_path.stem}_llm_usage.jsonl")
+    if not resume_row_index and usage_log_path.exists():
+        usage_log_path.unlink()
+    usage_recorder = LLMUsageRecorder(
+        usage_log_path,
+        metadata={
+            "suite": "persona",
+            "method": "robust",
+            "model": model,
+            "backend": backend,
+            "size": size,
+            "benchmark_file": str(benchmark_file),
+            "output_path": str(output_path),
+            "worker_id": worker_id,
+            "num_workers": num_workers,
+        },
+    )
 
     file_mode = "a" if resume_row_index else "w"
     with output_path.open(file_mode, encoding="utf-8", newline="") as f:
@@ -878,7 +1072,8 @@ def evaluate_persona_benchmark(
             output_row = row.copy()
             try:
                 chat_history_path = resolve_chat_history_path(row, size=size, persona_root=persona_root)
-                agent = agent_manager.get_agent(chat_history_path)
+                with llm_usage_recorder(usage_recorder), llm_usage_stage("ingestion"):
+                    agent = agent_manager.get_agent(chat_history_path, str(row.get("persona_id", "")))
                 user_query = parse_user_query(row.get("user_query", ""))
                 question = user_query.get("content", "")
 
@@ -889,7 +1084,8 @@ def evaluate_persona_benchmark(
                         seed=stable_int_seed(row.get("persona_id", ""), row.get("user_query", "")),
                     )
 
-                    answer_result = agent.answer_mcq(question, option_mapping)
+                    with llm_usage_recorder(usage_recorder), llm_usage_stage("qa.mcq"):
+                        answer_result = agent.answer_mcq(question, option_mapping)
                     prediction = extract_final_answer(answer_result["response"])
                     is_correct = check_mcq_correctness(
                         prediction,
@@ -914,7 +1110,8 @@ def evaluate_persona_benchmark(
                     mcq_processed += 1
 
                 if eval_mode in ("generative", "both"):
-                    openended_result = agent.answer_openended(question)
+                    with llm_usage_recorder(usage_recorder), llm_usage_stage("qa.openended"):
+                        openended_result = agent.answer_openended(question)
                     output_row[f"model_response_openended_{size}"] = openended_result["response"]
                     output_row[f"is_correct_openended_{size}"] = ""
                     output_row[f"raw_input_prompt_openended_{size}"] = openended_result["prompt"]
@@ -927,6 +1124,8 @@ def evaluate_persona_benchmark(
 
                 processed += 1
             except Exception as e:
+                if is_nonrecoverable_llm_error(e):
+                    raise
                 if eval_mode in ("mcq", "both"):
                     output_row[f"model_response_mcq_{size}"] = f"ERROR: {e}"
                     output_row[f"predicted_answer_mcq_{size}"] = ""
@@ -945,10 +1144,13 @@ def evaluate_persona_benchmark(
             written_rows.append(output_row)
 
     metrics_path = write_metrics_file(output_path, written_rows, size)
+    usage_summary_path = write_usage_summary_file(output_path, usage_recorder)
     if mcq_processed:
         eval_logger.info("Overall accuracy: %.3f (%d/%d)", correct / mcq_processed, correct, mcq_processed)
     eval_logger.info("Results saved to %s", output_path)
     eval_logger.info("Metrics saved to %s", metrics_path)
+    eval_logger.info("LLM usage saved to %s", usage_log_path)
+    eval_logger.info("LLM usage summary saved to %s", usage_summary_path)
     return output_path
 
 
@@ -977,6 +1179,26 @@ def merge_worker_outputs(worker_outputs: List[Path], merged_output: Path, size: 
         writer.writerows(rows)
 
     write_metrics_file(merged_output, rows, size)
+    merged_usage_log = merged_output.with_name(f"{merged_output.stem}_llm_usage.jsonl")
+    if merged_usage_log.exists():
+        merged_usage_log.unlink()
+    merged_usage_recorder = LLMUsageRecorder(
+        merged_usage_log,
+        metadata={
+            "merged_output": str(merged_output),
+            "worker_outputs": [str(path) for path in worker_outputs],
+        },
+    )
+    for worker_output in worker_outputs:
+        worker_usage_log = worker_output.with_name(f"{worker_output.stem}_llm_usage.jsonl")
+        if not worker_usage_log.exists():
+            continue
+        with worker_usage_log.open("r", encoding="utf-8") as f_usage:
+            for line in f_usage:
+                if not line.strip():
+                    continue
+                merged_usage_recorder.record(json.loads(line))
+    write_usage_summary_file(merged_output, merged_usage_recorder)
     return merged_output
 
 
@@ -1033,12 +1255,39 @@ def run_batch_workers(args: argparse.Namespace, benchmark_file: Path, output_pat
         worker_outputs.append(worker_output)
 
     failures = []
-    for worker_id, worker_output, worker_stderr, process in processes:
-        return_code = process.wait()
-        if return_code != 0:
-            failures.append((worker_id, return_code))
-        else:
+    remaining = list(processes)
+    while remaining:
+        progressed = False
+        for worker_id, worker_output, worker_stderr, process in list(remaining):
+            return_code = process.poll()
+            if return_code is None:
+                continue
+            progressed = True
+            remaining.remove((worker_id, worker_output, worker_stderr, process))
+            if return_code != 0:
+                failures.append((worker_id, return_code))
+                logger.error(
+                    "worker_id=%s failed exit=%s stderr_log=%s; terminating remaining workers",
+                    worker_id,
+                    return_code,
+                    worker_stderr,
+                )
+                for other_worker_id, _other_output, other_stderr, other_process in remaining:
+                    if other_process.poll() is None:
+                        logger.error("terminating worker_id=%s stderr_log=%s", other_worker_id, other_stderr)
+                        other_process.terminate()
+                for other_worker_id, _other_output, other_stderr, other_process in remaining:
+                    try:
+                        other_process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        logger.error("killing worker_id=%s stderr_log=%s", other_worker_id, other_stderr)
+                        other_process.kill()
+                        other_process.wait()
+                remaining.clear()
+                break
             logger.info("worker_id=%s completed output=%s stderr_log=%s", worker_id, worker_output, worker_stderr)
+        if remaining and not progressed:
+            time.sleep(1.0)
 
     if failures:
         failed = ", ".join(f"worker {worker_id} (exit {code})" for worker_id, code in failures)
